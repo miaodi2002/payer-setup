@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Create OU and attach SCP to Root, Free, Normal OU"
+
+Parameters:
+  RootId:
+    Type: String
+    Description: "AWS Organizations root ID"
+
+Resources:
+  # 建立 Free OU
+  FreeOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Free"
+      ParentId: !Ref RootId
+
+  # 建立 Block OU
+  BlockOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Block"
+      ParentId: !Ref RootId
+
+  # 建立 Normal OU
+  NormalOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Normal"
+      ParentId: !Ref RootId
+
+  DenyAccessNonPayAsGoDenyBigSizeACM:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyAccessNonPayAsGo_DenyBigSize_ACM"
+      Description: "SCP to deny reserved instances, large EC2 instances, and ACM CA operations."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyAccessNonPayAsGo"
+            Effect: "Deny"
+            Action:
+              - "ec2:PurchaseReservedInstancesOffering"
+              - "ec2:AcceptReservedInstancesExchangeQuote"
+              - "ec2:CancelCapacityReservation"
+              - "ec2:CancelReservedInstancesListing"
+              - "ec2:CreateCapacityReservation"
+              - "ec2:CreateReservedInstancesListing"
+              - "savingsplans:*"
+              - "ec2:DescribeReservedInstances"
+              - "ec2:DescribeReservedInstancesListings"
+              - "ec2:ModifyReservedInstances"
+              - "rds:PurchaseReservedDBInstancesOffering"
+              - "elasticache:PurchaseReservedCacheNodesOffering"
+              - "directconnect:*"
+              - "outposts:*"
+            Resource: "*"
+
+          - Sid: "limitedSize"
+            Effect: "Deny"
+            Action: "ec2:RunInstances"
+            Resource: "arn:aws:ec2:*:*:instance/*"
+            Condition:
+              ForAnyValue:StringNotLike:
+                "ec2:InstanceType":
+                  - "*.nano"
+                  - "*.small"
+                  - "*.micro"
+                  - "*.medium"
+                  - "*.large"
+                  - "*.xlarge"
+                  - "*.2xlarge"
+                  - "*.3xlarge"
+                  - "*.4xlarge"
+                  - "*.6xlarge"
+                  - "*.8xlarge"
+                  - "*.9xlarge"
+                  - "*.10xlarge"
+                  - "*.12xlarge"
+                  - "*.16xlarge"
+
+          - Sid: "DenyACM"
+            Effect: "Deny"
+            Action:
+              - "acm-pca:CreateCertificateAuthority"
+              - "acm-pca:DeleteCertificateAuthority"
+              - "acm-pca:CreatePermission"
+              - "acm-pca:DeletePermission"
+              - "acm-pca:DescribeCertificateAuthorityAuditReport"
+              - "acm-pca:RestoreCertificateAuthority"
+              - "acm-pca:TagCertificateAuthority"
+              - "acm-pca:UntagCertificateAuthority"
+            Resource: "*"
+
+  DenyLeaveOrganization:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyLeaveOrganization"
+      Description: "SCP to prevent accounts from leaving the AWS Organization."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Statement1"
+            Effect: "Deny"
+            Action:
+              - "organizations:LeaveOrganization"
+            Resource: "*"
+
+  DenyRoot:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyRoot"
+      Description: "SCP to deny all actions for the root user."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyRootUser"
+            Effect: "Deny"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn: "arn:aws:iam::*:root"  
+        
+  DenyRootChange:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyRootChange"
+      Description: "SCP to deny account email address change."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Deny"
+            Action: "iam:UpdateAccountEmailAddress"
+            Resource: "*"
+
+  DenySupport:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenySupport"
+      Description: "SCP to deny support plan changes."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Deny"
+            Action: "supportplans:*"
+            Resource: "*"
+
+  DenyShield:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyShield"
+      Description: "SCP to deny Shield subscription updates."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Statement1"
+            Effect: "Deny"
+            Action:
+              - "shield:UpdateSubscription"
+            Resource: "*"
+
+  DenyCloudFront:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "Deny_CloudFront"
+      Description: "Service Control Policy to deny all CloudFront actions for specified IAM users."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Deny"
+            Action:
+              - "cloudfront:*"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn:
+                  - "arn:aws:iam::*:root"
+                  - "arn:aws:iam::*:user/a*"
+                  - "arn:aws:iam::*:user/A*"
+                  - "arn:aws:iam::*:user/b*"
+                  - "arn:aws:iam::*:user/B*"
+                  - "arn:aws:iam::*:user/c*"
+                  - "arn:aws:iam::*:user/C*"
+                  - "arn:aws:iam::*:user/d*"
+                  - "arn:aws:iam::*:user/D*"
+                  - "arn:aws:iam::*:user/e*"
+                  - "arn:aws:iam::*:user/E*"
+                  - "arn:aws:iam::*:user/f*"
+                  - "arn:aws:iam::*:user/F*"
+                  - "arn:aws:iam::*:user/g*"
+                  - "arn:aws:iam::*:user/G*"
+                  - "arn:aws:iam::*:user/h*"
+                  - "arn:aws:iam::*:user/H*"
+                  - "arn:aws:iam::*:user/i*"
+                  - "arn:aws:iam::*:user/I*"
+                  - "arn:aws:iam::*:user/j*"
+                  - "arn:aws:iam::*:user/J*"
+                  - "arn:aws:iam::*:user/k*"
+                  - "arn:aws:iam::*:user/K*"
+                  - "arn:aws:iam::*:user/l*"
+                  - "arn:aws:iam::*:user/L*"
+                  - "arn:aws:iam::*:user/m*"
+                  - "arn:aws:iam::*:user/M*"
+                  - "arn:aws:iam::*:user/n*"
+                  - "arn:aws:iam::*:user/N*"
+                  - "arn:aws:iam::*:user/o*"
+                  - "arn:aws:iam::*:user/O*"
+                  - "arn:aws:iam::*:user/p*"
+                  - "arn:aws:iam::*:user/P*"
+                  - "arn:aws:iam::*:user/q*"
+                  - "arn:aws:iam::*:user/Q*"
+                  - "arn:aws:iam::*:user/r*"
+                  - "arn:aws:iam::*:user/R*"
+                  - "arn:aws:iam::*:user/s*"
+                  - "arn:aws:iam::*:user/S*"
+                  - "arn:aws:iam::*:user/t*"
+                  - "arn:aws:iam::*:user/T*"
+                  - "arn:aws:iam::*:user/u*"
+                  - "arn:aws:iam::*:user/U*"
+                  - "arn:aws:iam::*:user/v*"
+                  - "arn:aws:iam::*:user/V*"
+                  - "arn:aws:iam::*:user/w*"
+                  - "arn:aws:iam::*:user/W*"
+                  - "arn:aws:iam::*:user/x*"
+                  - "arn:aws:iam::*:user/X*"
+                  - "arn:aws:iam::*:user/y*"
+                  - "arn:aws:iam::*:user/Y*"
+                  - "arn:aws:iam::*:user/z*"
+                  - "arn:aws:iam::*:user/Z*"
+                  - "arn:aws:iam::*:user/0*"
+                  - "arn:aws:iam::*:user/1*"
+                  - "arn:aws:iam::*:user/2*"
+                  - "arn:aws:iam::*:user/3*"
+                  - "arn:aws:iam::*:user/4*"
+                  - "arn:aws:iam::*:user/5*"
+                  - "arn:aws:iam::*:user/6*"
+                  - "arn:aws:iam::*:user/7*"
+                  - "arn:aws:iam::*:user/8*"
+                  - "arn:aws:iam::*:user/9*"
+                  - "arn:aws:iam::*:user/+*"
+                  - "arn:aws:iam::*:user/=*"
+                  - "arn:aws:iam::*:user/,*"
+                  - "arn:aws:iam::*:user/.*"
+                  - "arn:aws:iam::*:user/_*"
+                  - "arn:aws:iam::*:user/-*"
+
+  # Lambda IAM Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaOrganizationsRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAttachPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:AttachPolicy
+                Resource: "*"
+
+  # Lambda Function (Python)
+  AttachSCPLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AttachSCPToOU
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          organizations = boto3.client('organizations')
+
+          def lambda_handler(event, context):
+              try:
+                  for scp in event['ResourceProperties']['SCPAssignments']:
+                      organizations.attach_policy(PolicyId=scp["PolicyId"], TargetId=scp["TargetId"])
+
+                  response_data = {"Message": "All SCPs Attached Successfully"}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  # Custom Resource 觸發 Lambda
+  InvokeLambda:
+    Type: Custom::InvokeLambda
+    Properties:
+      ServiceToken: !GetAtt AttachSCPLambda.Arn
+      SCPAssignments:
+        - PolicyId: !Ref DenyShield
+          TargetId: !Ref RootId
+        - PolicyId: !Ref DenySupport
+          TargetId: !Ref FreeOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref FreeOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyRoot
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyCloudFront
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyRootChange
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenySupport
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenyAccessNonPayAsGoDenyBigSizeACM
+          TargetId: !Ref NormalOU
+
+Outputs:
+  FreeOUId:
+    Description: "ID of the Free OU"
+    Value: !Ref FreeOU
+    Export:
+      Name: !Sub "${AWS::StackName}-FreeOUId"
+
+  BlockOUId:
+    Description: "ID of the Block OU"
+    Value: !Ref BlockOU
+    Export:
+      Name: !Sub "${AWS::StackName}-BlockOUId"
+
+  NormalOUId:
+    Description: "ID of the Normal OU"
+    Value: !Ref NormalOU
+    Export:
+      Name: !Sub "${AWS::StackName}-NormalOUId"

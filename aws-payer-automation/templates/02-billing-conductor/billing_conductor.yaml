@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Create AWS Account and BillingConductor BillingGroup automatically"
+
+Resources:
+  # Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaBillingConductorRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAndBillingAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - organizations:CreateAccount
+                  - organizations:ListAccounts
+                  - billingconductor:CreateBillingGroup
+                  - billingconductor:AssociatePricingRules
+                  - billingconductor:ListBillingGroups
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda函数
+  CreateAccountAndBillingGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateAccountAndBillingGroup
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900  # 15分钟，账户创建可能需要较长时间
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+          import re
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # 删除时不做任何操作，避免删除已创建的账户
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  billingconductor = boto3.client('billingconductor')
+
+                  # 1. 获取Management Account信息
+                  org_info = organizations.describe_organization()
+                  master_account_id = org_info['Organization']['MasterAccountId']
+                  
+                  master_account_info = organizations.describe_account(AccountId=master_account_id)
+                  master_account_name = master_account_info['Account']['Name']
+                  master_account_email = master_account_info['Account']['Email']
+
+                  print(f"Master Account: {master_account_name} ({master_account_email})")
+
+                  # 2. 生成新账户邮箱和名称
+                  new_account_name = f"{master_account_name}-Bills"
+                  base_email = generate_bills_email(master_account_email)
+                  
+                  # 3. 检查邮箱是否已存在，如果存在则添加数字后缀
+                  new_account_email = find_available_email(organizations, base_email)
+                  
+                  print(f"Creating new account: {new_account_name} ({new_account_email})")
+
+                  # 4. 创建新账户
+                  create_response = organizations.create_account(
+                      Email=new_account_email,
+                      AccountName=new_account_name
+                  )
+                  
+                  request_id = create_response['CreateAccountStatus']['Id']
+                  print(f"Account creation request ID: {request_id}")
+
+                  # 5. 等待账户创建完成
+                  new_account_id = wait_for_account_creation(organizations, request_id)
+                  print(f"New account created: {new_account_id}")
+
+                  # 6. 创建BillingGroup
+                  billing_group_arn = create_billing_group(billingconductor, new_account_id)
+                  print(f"BillingGroup created: {billing_group_arn}")
+
+                  response_data = {
+                      "NewAccountId": new_account_id,
+                      "NewAccountEmail": new_account_email,
+                      "BillingGroupArn": billing_group_arn,
+                      "Message": "Account and BillingGroup created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def generate_bills_email(original_email):
+              """生成+bills邮箱alias"""
+              if '+' in original_email:
+                  # 如果已经有alias，在@前添加bills
+                  local, domain = original_email.split('@')
+                  return f"{local}bills@{domain}"
+              else:
+                  # 没有alias，添加+bills
+                  local, domain = original_email.split('@')
+                  return f"{local}+bills@{domain}"
+
+          def find_available_email(organizations, base_email):
+              """查找可用的邮箱地址"""
+              # 获取所有现有账户
+              accounts = organizations.list_accounts()['Accounts']
+              existing_emails = {acc['Email'].lower() for acc in accounts}
+              
+              # 检查基础邮箱是否可用
+              if base_email.lower() not in existing_emails:
+                  return base_email
+              
+              # 如果不可用，添加数字后缀
+              local, domain = base_email.split('@')
+              if '+bills' in local:
+                  base_local = local  # service+bills
+              else:
+                  base_local = local.replace('bills', '+bills')  # servicebills -> service+bills
+              
+              for i in range(1, 100):  # 最多尝试99次
+                  test_email = f"{base_local}{i}@{domain}"
+                  if test_email.lower() not in existing_emails:
+                      return test_email
+              
+              raise Exception("Cannot find available email after 99 attempts")
+
+          def wait_for_account_creation(organizations, request_id):
+              """等待账户创建完成"""
+              max_attempts = 60  # 最多等待30分钟 (60 * 30秒)
+              
+              for attempt in range(max_attempts):
+                  time.sleep(30)  # 等待30秒
+                  
+                  status = organizations.describe_create_account_status(
+                      CreateAccountRequestId=request_id
+                  )
+                  
+                  state = status['CreateAccountStatus']['State']
+                  print(f"Account creation attempt {attempt + 1}: {state}")
+                  
+                  if state == 'SUCCEEDED':
+                      return status['CreateAccountStatus']['AccountId']
+                  elif state == 'FAILED':
+                      failure_reason = status['CreateAccountStatus'].get('FailureReason', 'Unknown')
+                      raise Exception(f"Account creation failed: {failure_reason}")
+              
+              raise Exception("Account creation timeout after 30 minutes")
+
+          def create_billing_group(billingconductor, primary_account_id):
+              """创建BillingGroup"""
+              try:
+                  response = billingconductor.create_billing_group(
+                      Name='Bills',
+                      Description='Billing group for customer original pricing',
+                      PrimaryAccountId=primary_account_id,
+                      ComputationPreference={
+                          'PricingPlanArn': 'arn:aws:billingconductor::aws:pricing-plan/AWS_STANDARD'
+                      }
+                  )
+                  return response['Arn']
+              except Exception as e:
+                  print(f"BillingGroup creation error: {str(e)}")
+                  raise
+
+  # Custom Resource触发Lambda
+  CreateAccountAndBillingGroup:
+    Type: Custom::CreateAccountAndBillingGroup
+    Properties:
+      ServiceToken: !GetAtt CreateAccountAndBillingGroupFunction.Arn
+
+Outputs:
+  NewAccountId:
+    Description: "ID of the newly created account"
+    Value: !GetAtt CreateAccountAndBillingGroup.NewAccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-NewAccountId"
+
+  NewAccountEmail:
+    Description: "Email of the newly created account"
+    Value: !GetAtt CreateAccountAndBillingGroup.NewAccountEmail
+    Export:
+      Name: !Sub "${AWS::StackName}-NewAccountEmail"
+
+  BillingGroupArn:
+    Description: "ARN of the created BillingGroup"
+    Value: !GetAtt CreateAccountAndBillingGroup.BillingGroupArn
+    Export:
+      Name: !Sub "${AWS::StackName}-BillingGroupArn"

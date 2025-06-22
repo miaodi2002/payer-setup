@@ -1,0 +1,749 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Setup Athena environment for CUR data analysis - supports both Pro forma and RISP CUR"
+
+Parameters:
+  ProformaBucketName:
+    Type: String
+    Description: "S3 bucket name for Pro forma CUR data"
+  
+  RISPBucketName:
+    Type: String
+    Description: "S3 bucket name for RISP CUR data"
+    
+  ProformaReportName:
+    Type: String
+    Description: "Pro forma CUR report name (Master Account ID)"
+    
+  RISPReportName:
+    Type: String
+    Description: "RISP CUR report name"
+
+Resources:
+  # Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaAthenaSetupRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaSetupAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - glue:CreateDatabase
+                  - glue:CreateCrawler
+                  - glue:CreateTable
+                  - glue:StartCrawler
+                  - glue:UpdateDatabase
+                  - glue:UpdatePartition
+                  - glue:UpdateTable
+                  - glue:ImportCatalogToGlue
+                  - glue:GetDatabase
+                  - glue:GetCrawler
+                  - glue:GetTable
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                  - s3:ListBucket
+                  - lambda:AddPermission
+                  - lambda:CreateFunction
+                  - lambda:GetFunction
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:PassRole
+                  - iam:GetRole
+                  - kms:Decrypt
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda函数：创建完整的Athena环境
+  CreateAthenaEnvironmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateAthenaEnvironment
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+          import uuid
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # 删除时不删除已创建的资源，避免数据丢失
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  glue = boto3.client('glue')
+                  iam = boto3.client('iam')
+                  lambda_client = boto3.client('lambda')
+                  s3 = boto3.client('s3')
+
+                  # 获取参数
+                  proforma_bucket = event['ResourceProperties']['ProformaBucketName']
+                  risp_bucket = event['ResourceProperties']['RISPBucketName']
+                  proforma_report = event['ResourceProperties']['ProformaReportName']
+                  risp_report = event['ResourceProperties']['RISPReportName']
+
+                  # 获取Account ID
+                  org_info = organizations.describe_organization()
+                  account_id = org_info['Organization']['MasterAccountId']
+
+                  print(f"Setting up Athena for Account: {account_id}")
+
+                  # 1. 创建Glue Database
+                  database_name = f"athenacurcfn_{account_id}"
+                  create_glue_database(glue, database_name, account_id)
+
+                  # 2. 创建IAM角色
+                  crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
+                  lambda_role_arn = create_lambda_executor_role(iam)
+                  s3_lambda_role_arn = create_s3_lambda_role(iam, proforma_bucket, risp_bucket)
+
+                  # 3. 创建Lambda函数（Crawler初始化器）
+                  initializer_function_arn = create_crawler_initializer(lambda_client, lambda_role_arn, account_id)
+
+                  # 4. 创建Glue Crawlers
+                  proforma_crawler_name = f"AWSCURCrawler-{account_id}"
+                  risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
+                  
+                  create_glue_crawler(glue, proforma_crawler_name, database_name, crawler_role_arn, 
+                                    proforma_bucket, proforma_report)
+                  create_glue_crawler(glue, risp_crawler_name, database_name, crawler_role_arn, 
+                                    risp_bucket, risp_report)
+
+                  # 5. 创建状态表
+                  create_status_tables(glue, database_name, account_id, proforma_bucket, risp_bucket, 
+                                      proforma_report, risp_report)
+
+                  # 6. 设置S3通知
+                  notification_function_arn = create_s3_notification_function(lambda_client, s3_lambda_role_arn, 
+                                                                            initializer_function_arn)
+                  setup_s3_notifications(s3, lambda_client, notification_function_arn, initializer_function_arn,
+                                        proforma_bucket, risp_bucket, proforma_report, risp_report, account_id)
+
+                  # 7. 启动初始爬取
+                  start_initial_crawl(glue, proforma_crawler_name, risp_crawler_name)
+
+                  response_data = {
+                      "DatabaseName": database_name,
+                      "ProformaCrawlerName": proforma_crawler_name,
+                      "RISPCrawlerName": risp_crawler_name,
+                      "Message": "Athena environment created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def create_glue_database(glue, database_name, account_id):
+              """创建Glue Database"""
+              try:
+                  # 检查database是否已存在
+                  try:
+                      glue.get_database(Name=database_name)
+                      print(f"Database {database_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  # 创建database
+                  glue.create_database(
+                      DatabaseInput={
+                          'Name': database_name,
+                          'Description': f'Database for CUR data analysis - Account {account_id}'
+                      }
+                  )
+                  print(f"Created database: {database_name}")
+
+              except Exception as e:
+                  print(f"Database creation error: {str(e)}")
+                  raise
+
+          def create_crawler_role(iam, account_id, proforma_bucket, risp_bucket):
+              """创建Glue Crawler执行角色"""
+              role_name = f"AWSCURCrawlerRole-{account_id}"
+              
+              try:
+                  # 检查角色是否已存在
+                  try:
+                      role = iam.get_role(RoleName=role_name)
+                      print(f"Crawler role {role_name} already exists")
+                      return role['Role']['Arn']
+                  except iam.exceptions.NoSuchEntityException:
+                      pass
+
+                  # 创建角色
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Principal": {"Service": "glue.amazonaws.com"},
+                              "Action": "sts:AssumeRole"
+                          }
+                      ]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description=f"Role for Glue Crawlers to access CUR data - Account {account_id}"
+                  )
+
+                  # 附加AWS管理的Glue策略
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+                  )
+
+                  # 创建S3访问策略
+                  s3_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Action": [
+                                  "s3:GetObject",
+                                  "s3:ListBucket"
+                              ],
+                              "Resource": [
+                                  f"arn:aws:s3:::{proforma_bucket}",
+                                  f"arn:aws:s3:::{proforma_bucket}/*",
+                                  f"arn:aws:s3:::{risp_bucket}",
+                                  f"arn:aws:s3:::{risp_bucket}/*"
+                              ]
+                          }
+                      ]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='S3CURAccess',
+                      PolicyDocument=json.dumps(s3_policy)
+                  )
+
+                  print(f"Created crawler role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"Crawler role creation error: {str(e)}")
+                  raise
+
+          def create_lambda_executor_role(iam):
+              """创建Lambda Crawler执行角色"""
+              role_name = "AWSCURCrawlerLambdaExecutor"
+              
+              try:
+                  # 检查角色是否已存在
+                  try:
+                      role = iam.get_role(RoleName=role_name)
+                      print(f"Lambda executor role {role_name} already exists")
+                      return role['Role']['Arn']
+                  except iam.exceptions.NoSuchEntityException:
+                      pass
+
+                  # 创建角色
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Principal": {"Service": "lambda.amazonaws.com"},
+                              "Action": "sts:AssumeRole"
+                          }
+                      ]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description="Role for Lambda to execute Glue Crawlers"
+                  )
+
+                  # 附加基本Lambda执行策略
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+                  )
+
+                  # 创建Glue访问策略
+                  glue_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Action": [
+                                  "glue:StartCrawler",
+                                  "glue:GetCrawler",
+                                  "glue:GetCrawlerMetrics"
+                              ],
+                              "Resource": "*"
+                          }
+                      ]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='GlueExecutorAccess',
+                      PolicyDocument=json.dumps(glue_policy)
+                  )
+
+                  print(f"Created lambda executor role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"Lambda executor role creation error: {str(e)}")
+                  raise
+
+          def create_s3_lambda_role(iam, proforma_bucket, risp_bucket):
+              """创建S3通知Lambda角色"""
+              role_name = "AWSS3CURLambdaExecutor"
+              
+              try:
+                  # 检查角色是否已存在
+                  try:
+                      role = iam.get_role(RoleName=role_name)
+                      print(f"S3 Lambda role {role_name} already exists")
+                      return role['Role']['Arn']
+                  except iam.exceptions.NoSuchEntityException:
+                      pass
+
+                  # 创建角色
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Principal": {"Service": "lambda.amazonaws.com"},
+                              "Action": "sts:AssumeRole"
+                          }
+                      ]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description="Role for S3 notification Lambda functions"
+                  )
+
+                  # 附加基本Lambda执行策略
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+                  )
+
+                  # 创建S3和Lambda访问策略
+                  lambda_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Action": [
+                                  "s3:GetObject",
+                                  "lambda:InvokeFunction"
+                              ],
+                              "Resource": [
+                                  f"arn:aws:s3:::{proforma_bucket}/*",
+                                  f"arn:aws:s3:::{risp_bucket}/*",
+                                  "arn:aws:lambda:*:*:function:AWSCURInitializer-*"
+                              ]
+                          }
+                      ]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='S3LambdaAccess',
+                      PolicyDocument=json.dumps(lambda_policy)
+                  )
+
+                  print(f"Created S3 lambda role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"S3 Lambda role creation error: {str(e)}")
+                  raise
+
+          def create_crawler_initializer(lambda_client, role_arn, account_id):
+              """创建Crawler初始化Lambda函数"""
+              function_name = f"AWSCURInitializer-{account_id}"
+              
+              try:
+                  # 检查函数是否已存在
+                  try:
+                      lambda_client.get_function(FunctionName=function_name)
+                      print(f"Initializer function {function_name} already exists")
+                      return f"arn:aws:lambda:us-east-1:{account_id}:function:{function_name}"
+                  except lambda_client.exceptions.ResourceNotFoundException:
+                      pass
+
+                  # Lambda函数代码
+                  lambda_code = '''
+import json
+import boto3
+
+def lambda_handler(event, context):
+    glue = boto3.client('glue')
+    
+    try:
+        # 从事件中获取爬虫名称
+        crawler_name = event.get('crawler_name', event.get('CrawlerName'))
+        
+        if not crawler_name:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing crawler_name parameter')
+            }
+        
+        # 启动爬虫
+        response = glue.start_crawler(Name=crawler_name)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(f'Started crawler: {crawler_name}')
+        }
+        
+    except Exception as e:
+        print(f'Error: {str(e)}')
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error starting crawler: {str(e)}')
+        }
+'''
+
+                  # 创建函数
+                  response = lambda_client.create_function(
+                      FunctionName=function_name,
+                      Runtime='python3.9',
+                      Role=role_arn,
+                      Handler='index.lambda_handler',
+                      Code={'ZipFile': lambda_code.encode('utf-8')},
+                      Description=f'Crawler initializer for CUR data - Account {account_id}',
+                      Timeout=60
+                  )
+
+                  print(f"Created initializer function: {function_name}")
+                  return response['FunctionArn']
+
+              except Exception as e:
+                  print(f"Initializer function creation error: {str(e)}")
+                  raise
+
+          def create_glue_crawler(glue, crawler_name, database_name, role_arn, bucket_name, report_name):
+              """创建Glue Crawler"""
+              try:
+                  # 检查crawler是否已存在
+                  try:
+                      glue.get_crawler(Name=crawler_name)
+                      print(f"Crawler {crawler_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  # S3目标路径
+                  s3_path = f"s3://{bucket_name}/daily/{report_name}/"
+
+                  # 创建crawler
+                  glue.create_crawler(
+                      Name=crawler_name,
+                      Role=role_arn,
+                      DatabaseName=database_name,
+                      Description=f'Crawler for CUR data in {bucket_name}',
+                      Targets={
+                          'S3Targets': [
+                              {
+                                  'Path': s3_path,
+                                  'Exclusions': ['**.json', '**.yml', '**.sql', '**.csv', '**.gz', '**.zip']
+                              }
+                          ]
+                      },
+                      SchemaChangePolicy={
+                          'UpdateBehavior': 'UPDATE_IN_DATABASE',
+                          'DeleteBehavior': 'LOG'
+                      }
+                  )
+
+                  print(f"Created crawler: {crawler_name} for {s3_path}")
+
+              except Exception as e:
+                  print(f"Crawler creation error for {crawler_name}: {str(e)}")
+                  raise
+
+          def create_status_tables(glue, database_name, account_id, proforma_bucket, risp_bucket, proforma_report, risp_report):
+              """创建CUR状态跟踪表"""
+              try:
+                  # Pro forma状态表
+                  proforma_table_name = "cost_and_usage_data_status"
+                  create_status_table(glue, database_name, proforma_table_name, proforma_bucket, proforma_report)
+
+                  # RISP状态表
+                  risp_table_name = "risp_cost_and_usage_data_status"
+                  create_status_table(glue, database_name, risp_table_name, risp_bucket, risp_report)
+
+                  print("Created status tracking tables")
+
+              except Exception as e:
+                  print(f"Status table creation error: {str(e)}")
+                  raise
+
+          def create_status_table(glue, database_name, table_name, bucket_name, report_name):
+              """创建单个状态表"""
+              try:
+                  # 检查表是否已存在
+                  try:
+                      glue.get_table(DatabaseName=database_name, Name=table_name)
+                      print(f"Status table {table_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  # 状态表的S3路径
+                  s3_location = f"s3://{bucket_name}/daily/{report_name}-status/"
+
+                  # 表结构
+                  table_input = {
+                      'Name': table_name,
+                      'Description': f'Status table for {report_name} CUR data',
+                      'StorageDescriptor': {
+                          'Columns': [
+                              {'Name': 'status', 'Type': 'string'},
+                              {'Name': 'report_name', 'Type': 'string'},
+                              {'Name': 'bill_date', 'Type': 'string'},
+                              {'Name': 'last_updated', 'Type': 'timestamp'}
+                          ],
+                          'Location': s3_location,
+                          'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+                          'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+                          'SerdeInfo': {
+                              'SerializationLibrary': 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe',
+                              'Parameters': {'field.delim': ','}
+                          }
+                      },
+                      'TableType': 'EXTERNAL_TABLE'
+                  }
+
+                  glue.create_table(
+                      DatabaseName=database_name,
+                      TableInput=table_input
+                  )
+
+                  print(f"Created status table: {table_name}")
+
+              except Exception as e:
+                  print(f"Status table {table_name} creation error: {str(e)}")
+                  raise
+
+          def create_s3_notification_function(lambda_client, role_arn, initializer_function_arn):
+              """创建S3通知处理Lambda函数"""
+              function_name = "AWSS3CURNotification"
+              
+              try:
+                  # 检查函数是否已存在
+                  try:
+                      lambda_client.get_function(FunctionName=function_name)
+                      print(f"S3 notification function {function_name} already exists")
+                      return f"arn:aws:lambda:us-east-1:{boto3.client('sts').get_caller_identity()['Account']}:function:{function_name}"
+                  except lambda_client.exceptions.ResourceNotFoundException:
+                      pass
+
+                  # Lambda函数代码
+                  lambda_code = f'''
+import json
+import boto3
+import urllib.parse
+
+def lambda_handler(event, context):
+    lambda_client = boto3.client('lambda')
+    
+    try:
+        for record in event['Records']:
+            # 解析S3事件
+            bucket = record['s3']['bucket']['name']
+            key = urllib.parse.unquote_plus(record['s3']['object']['key'], encoding='utf-8')
+            
+            # 判断是Pro forma还是RISP CUR
+            if 'bip-cur-' in bucket and not 'risp' in bucket:
+                # Pro forma CUR
+                crawler_name = key.split('/')[1].split('-')[0]  # 提取account ID
+                crawler_name = f"AWSCURCrawler-{{crawler_name}}"
+            elif 'bip-risp-cur-' in bucket:
+                # RISP CUR
+                crawler_name = key.split('/')[1].split('-')[1]  # 提取account ID
+                crawler_name = f"AWSRISPCURCrawler-{{crawler_name}}"
+            else:
+                continue
+            
+            # 调用初始化器启动爬虫
+            lambda_client.invoke(
+                FunctionName='{initializer_function_arn}',
+                InvocationType='Event',
+                Payload=json.dumps({{'crawler_name': crawler_name}})
+            )
+            
+        return {{'statusCode': 200, 'body': json.dumps('Processed S3 notifications')}}
+        
+    except Exception as e:
+        print(f'Error: {{str(e)}}')
+        return {{'statusCode': 500, 'body': json.dumps(f'Error: {{str(e)}}')}}
+'''
+
+                  # 创建函数
+                  response = lambda_client.create_function(
+                      FunctionName=function_name,
+                      Runtime='python3.9',
+                      Role=role_arn,
+                      Handler='index.lambda_handler',
+                      Code={'ZipFile': lambda_code.encode('utf-8')},
+                      Description='S3 notification handler for CUR data updates',
+                      Timeout=60
+                  )
+
+                  print(f"Created S3 notification function: {function_name}")
+                  return response['FunctionArn']
+
+              except Exception as e:
+                  print(f"S3 notification function creation error: {str(e)}")
+                  raise
+
+          def setup_s3_notifications(s3, lambda_client, notification_function_arn, initializer_function_arn, 
+                                   proforma_bucket, risp_bucket, proforma_report, risp_report, account_id):
+              """设置S3事件通知"""
+              try:
+                  # 为Lambda函数添加S3调用权限
+                  for bucket in [proforma_bucket, risp_bucket]:
+                      try:
+                          lambda_client.add_permission(
+                              FunctionName=notification_function_arn.split(':')[-1],
+                              StatementId=f'AllowS3Invoke-{bucket}',
+                              Action='lambda:InvokeFunction',
+                              Principal='s3.amazonaws.com',
+                              SourceArn=f'arn:aws:s3:::{bucket}'
+                          )
+                      except lambda_client.exceptions.ResourceConflictException:
+                          # 权限已存在
+                          pass
+
+                  # 配置S3事件通知
+                  for bucket, report in [(proforma_bucket, proforma_report), (risp_bucket, risp_report)]:
+                      try:
+                          # 获取现有通知配置
+                          try:
+                              current_config = s3.get_bucket_notification_configuration(Bucket=bucket)
+                          except:
+                              current_config = {}
+
+                          # 添加Lambda配置
+                          lambda_configs = current_config.get('LambdaConfigurations', [])
+                          
+                          # 检查是否已存在相同配置
+                          existing_config = None
+                          for config in lambda_configs:
+                              if config['LambdaFunctionArn'] == notification_function_arn:
+                                  existing_config = config
+                                  break
+
+                          if not existing_config:
+                              lambda_configs.append({
+                                  'Id': f'CURDataUpdate-{bucket}',
+                                  'LambdaFunctionArn': notification_function_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {'Name': 'prefix', 'Value': f'daily/{report}/'},
+                                              {'Name': 'suffix', 'Value': '.parquet'}
+                                          ]
+                                      }
+                                  }
+                              })
+
+                              # 更新通知配置
+                              notification_config = current_config.copy()
+                              notification_config['LambdaConfigurations'] = lambda_configs
+
+                              s3.put_bucket_notification_configuration(
+                                  Bucket=bucket,
+                                  NotificationConfiguration=notification_config
+                              )
+
+                              print(f"Set up S3 notification for bucket: {bucket}")
+
+                      except Exception as e:
+                          print(f"S3 notification setup error for {bucket}: {str(e)}")
+                          # 不让S3通知设置失败影响整个部署
+                          continue
+
+              except Exception as e:
+                  print(f"S3 notifications setup error: {str(e)}")
+                  # 不让S3通知设置失败影响整个部署
+
+          def start_initial_crawl(glue, proforma_crawler_name, risp_crawler_name):
+              """启动初始爬取"""
+              try:
+                  for crawler_name in [proforma_crawler_name, risp_crawler_name]:
+                      try:
+                          glue.start_crawler(Name=crawler_name)
+                          print(f"Started initial crawl for: {crawler_name}")
+                      except Exception as e:
+                          print(f"Initial crawl start error for {crawler_name}: {str(e)}")
+                          # 爬虫启动失败不影响整个部署
+                          continue
+
+              except Exception as e:
+                  print(f"Initial crawl error: {str(e)}")
+                  # 不让初始爬取失败影响整个部署
+
+  # Custom Resource触发Lambda
+  CreateAthenaEnvironment:
+    Type: Custom::CreateAthenaEnvironment
+    Properties:
+      ServiceToken: !GetAtt CreateAthenaEnvironmentFunction.Arn
+      ProformaBucketName: !Ref ProformaBucketName
+      RISPBucketName: !Ref RISPBucketName
+      ProformaReportName: !Ref ProformaReportName
+      RISPReportName: !Ref RISPReportName
+
+Outputs:
+  DatabaseName:
+    Description: "Glue database name for CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.DatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseName"
+
+  ProformaCrawlerName:
+    Description: "Pro forma CUR crawler name"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaCrawlerName"
+
+  RISPCrawlerName:
+    Description: "RISP CUR crawler name"
+    Value: !GetAtt CreateAthenaEnvironment.RISPCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCrawlerName"

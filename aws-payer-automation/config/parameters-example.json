@@ -1,0 +1,170 @@
+{
+  "Description": "Example parameter configuration for AWS Payer Automation deployment",
+  "Modules": {
+    "Module1_OU_SCP": {
+      "StackName": "payer-ou-scp-{TIMESTAMP}",
+      "Template": "templates/01-ou-scp/auto_SCP_1.yaml",
+      "Parameters": {
+        "RootId": {
+          "Description": "AWS Organizations root ID",
+          "Example": "r-abcd1234efgh5678",
+          "Required": true,
+          "HowToGet": "aws organizations list-roots --query 'Roots[0].Id' --output text"
+        }
+      },
+      "Prerequisites": [
+        "AWS Organizations must be enabled",
+        "SCP feature must be enabled in Organizations",
+        "User must have Organizations admin permissions"
+      ]
+    },
+    "Module2_BillingConductor": {
+      "StackName": "payer-billing-conductor-{TIMESTAMP}",
+      "Template": "templates/02-billing-conductor/billing_conductor.yaml",
+      "Parameters": {},
+      "Prerequisites": [
+        "AWS Organizations must be enabled",
+        "BillingConductor service must be available",
+        "User must have account creation permissions"
+      ],
+      "Outputs": {
+        "NewAccountId": "Account ID of the newly created bills account",
+        "NewAccountEmail": "Email address of the new account",
+        "BillingGroupArn": "ARN of the created BillingGroup (needed for Module 3)"
+      }
+    },
+    "Module3_ProFormaCUR": {
+      "StackName": "payer-cur-proforma-{TIMESTAMP}",
+      "Template": "templates/03-cur-proforma/cur_export_proforma.yaml",
+      "Parameters": {
+        "BillingGroupArn": {
+          "Description": "ARN of the BillingGroup from Module 2",
+          "Example": "arn:aws:billingconductor::123456789012:billinggroup/12345678",
+          "Required": true,
+          "HowToGet": "Output from Module 2 or aws cloudformation describe-stacks --stack-name <module2-stack> --query 'Stacks[0].Outputs[?OutputKey==`BillingGroupArn`].OutputValue' --output text"
+        }
+      },
+      "Prerequisites": [
+        "Module 2 must be deployed successfully",
+        "CUR service must be available (us-east-1 region only)",
+        "S3 permissions for bucket creation"
+      ],
+      "Dependencies": ["Module2_BillingConductor"]
+    },
+    "Module4_RISP_CUR": {
+      "StackName": "payer-cur-risp-{TIMESTAMP}",
+      "Template": "templates/04-cur-risp/cur_export_risp.yaml",
+      "Parameters": {},
+      "Prerequisites": [
+        "CUR service must be available (us-east-1 region only)",
+        "S3 permissions for bucket creation"
+      ],
+      "Dependencies": []
+    },
+    "Module5_Athena_Setup": {
+      "StackName": "payer-athena-setup-{TIMESTAMP}",
+      "Template": "templates/05-athena-setup/athena_setup.yaml",
+      "Parameters": {
+        "ProformaBucketName": {
+          "Description": "S3 bucket name for Pro forma CUR data",
+          "Example": "bip-cur-123456789012",
+          "Required": true,
+          "HowToGet": "Output from Module 3 or aws cloudformation describe-stacks --stack-name <module3-stack> --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' --output text"
+        },
+        "RISPBucketName": {
+          "Description": "S3 bucket name for RISP CUR data",
+          "Example": "bip-risp-cur-123456789012",
+          "Required": true,
+          "HowToGet": "Output from Module 4 or aws cloudformation describe-stacks --stack-name <module4-stack> --query 'Stacks[0].Outputs[?OutputKey==`RISPBucketName`].OutputValue' --output text"
+        },
+        "ProformaReportName": {
+          "Description": "Pro forma CUR report name",
+          "Example": "123456789012",
+          "Required": true,
+          "HowToGet": "Output from Module 3 (usually the Master Account ID)"
+        },
+        "RISPReportName": {
+          "Description": "RISP CUR report name",
+          "Example": "risp-123456789012",
+          "Required": true,
+          "HowToGet": "Output from Module 4 (usually risp-{AccountId})"
+        }
+      },
+      "Prerequisites": [
+        "Module 3 (Pro forma CUR) must be deployed successfully",
+        "Module 4 (RISP CUR) must be deployed successfully",
+        "Glue service permissions",
+        "Lambda creation permissions"
+      ],
+      "Dependencies": ["Module3_ProFormaCUR", "Module4_RISP_CUR"],
+      "Outputs": {
+        "DatabaseName": "Glue database name for Athena queries",
+        "ProformaCrawlerName": "Name of the Pro forma CUR crawler",
+        "RISPCrawlerName": "Name of the RISP CUR crawler"
+      }
+    }
+  },
+  "DeploymentOptions": {
+    "FullDeployment": {
+      "Script": "scripts/deploy.sh",
+      "Description": "Deploy all modules in correct order",
+      "Time": "60-75 minutes (including account creation and Athena setup)"
+    },
+    "SingleModule": {
+      "Script": "scripts/deploy-single.sh",
+      "Description": "Deploy individual modules",
+      "Examples": [
+        "./scripts/deploy-single.sh 1 --root-id r-abcd1234efgh5678",
+        "./scripts/deploy-single.sh 2",
+        "./scripts/deploy-single.sh 3 --billing-group-arn arn:aws:billingconductor::123456789012:billinggroup/12345678",
+        "./scripts/deploy-single.sh 4",
+        "./scripts/deploy-single.sh 5 --proforma-bucket bip-cur-123456789012 --risp-bucket bip-risp-cur-123456789012 --proforma-report 123456789012 --risp-report risp-123456789012"
+      ]
+    },
+    "Validation": {
+      "Script": "scripts/validate.sh",
+      "Description": "Validate all templates before deployment"
+    },
+    "Cleanup": {
+      "Script": "scripts/cleanup.sh",
+      "Description": "Clean up deployed resources",
+      "Warning": "Use with extreme caution - can delete all resources permanently"
+    }
+  },
+  "Configuration": {
+    "Region": "us-east-1",
+    "RegionNote": "CUR exports can only be created in us-east-1",
+    "StackPrefix": "payer",
+    "Capabilities": ["CAPABILITY_NAMED_IAM"],
+    "Timeouts": {
+      "Module1": "10 minutes",
+      "Module2": "30 minutes (account creation)",
+      "Module3": "10 minutes",
+      "Module4": "10 minutes",
+      "Module5": "15 minutes (Athena setup and crawler initialization)"
+    }
+  },
+  "ImportantNotes": [
+    "Account creation in Module 2 can take up to 30 minutes",
+    "CUR reports take up to 24 hours to generate first data",
+    "Athena crawlers take 10-15 minutes for initial data discovery",
+    "All stacks use CloudFormation exports for cross-stack references",
+    "S3 buckets are created with versioning and public access blocking",
+    "Lambda functions include comprehensive error handling",
+    "SCP policies are applied automatically after OU creation",
+    "Email aliases are automatically generated for new accounts",
+    "Glue database and crawlers are set up automatically for both Pro forma and RISP data",
+    "S3 event notifications trigger automatic data updates"
+  ],
+  "TroubleshootingTips": [
+    "If account creation fails, check email uniqueness",
+    "If CUR creation fails, verify region is us-east-1",
+    "If SCP attachment fails, check Organizations permissions",
+    "If Athena setup fails, check Glue and Lambda permissions",
+    "If crawlers don't start, verify S3 bucket permissions and data existence",
+    "If tables are empty, ensure CUR data has been generated (wait 24+ hours)",
+    "If stack deletion fails, check for retention policies on resources",
+    "Use validate.sh to check templates before deployment",
+    "Use cleanup.sh --list to see all deployed stacks"
+  ]
+}
