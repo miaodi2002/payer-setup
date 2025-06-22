@@ -134,15 +134,22 @@ aws organizations describe-organization
 ```bash
 # 症状
 ERROR: "Policy type SERVICE_CONTROL_POLICY is not enabled"
+ERROR: "PolicyTypeNotEnabledException when calling the AttachPolicy operation"
 
 # 诊断
 aws organizations describe-organization --query 'Organization.AvailablePolicyTypes'
 
-# 解决方案
+# 解决方案 (自动化)
+# ✅ 最新版本的模板已自动处理此问题
+# Lambda函数会自动启用SCP并重试策略附加
+
+# 手动解决方案（如果需要）
 ROOT_ID=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
 aws organizations enable-policy-type \
     --root-id $ROOT_ID \
     --policy-type SERVICE_CONTROL_POLICY
+
+# 等待几秒钟后重新部署栈
 ```
 
 #### 常见问题 3: Lambda执行超时

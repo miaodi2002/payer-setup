@@ -20,6 +20,16 @@ This module creates the organizational structure and applies Service Control Pol
 ## Parameters
 - `RootId`: The AWS Organizations root ID (required)
 
+## Prerequisites
+- AWS Organizations must be enabled
+- User must have Organizations admin permissions
+- Note: SCP feature will be automatically enabled if not already enabled
+
+## Features
+- **Auto SCP Enablement**: Automatically enables SCP policy type if not enabled
+- **Retry Logic**: Handles timing issues with policy attachments
+- **Error Recovery**: Comprehensive error handling and logging
+
 ## Deployment
 ```bash
 aws cloudformation create-stack \

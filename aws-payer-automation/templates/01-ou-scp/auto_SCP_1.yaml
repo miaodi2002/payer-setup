@@ -274,6 +274,9 @@ Resources:
               - Effect: Allow
                 Action:
                   - organizations:AttachPolicy
+                  - organizations:EnablePolicyType
+                  - organizations:DescribeOrganization
+                  - organizations:ListRoots
                 Resource: "*"
 
   # Lambda Function (Python)
@@ -284,24 +287,80 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 30
+      Timeout: 60
       Code:
         ZipFile: |
           import json
           import boto3
           import cfnresponse
-
-          organizations = boto3.client('organizations')
+          import time
 
           def lambda_handler(event, context):
               try:
+                  organizations = boto3.client('organizations')
+                  
+                  # 1. Check if SCP is enabled, if not, enable it
+                  ensure_scp_enabled(organizations)
+                  
+                  # 2. Attach SCPs to targets
                   for scp in event['ResourceProperties']['SCPAssignments']:
-                      organizations.attach_policy(PolicyId=scp["PolicyId"], TargetId=scp["TargetId"])
+                      attach_policy_with_retry(organizations, scp["PolicyId"], scp["TargetId"])
 
                   response_data = {"Message": "All SCPs Attached Successfully"}
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
               except Exception as e:
+                  print(f"Error: {str(e)}")
                   cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def ensure_scp_enabled(organizations):
+              """Ensure SCP policy type is enabled"""
+              try:
+                  # Get organization info
+                  org_info = organizations.describe_organization()
+                  available_types = org_info['Organization']['AvailablePolicyTypes']
+                  
+                  # Check if SCP is already enabled
+                  scp_enabled = any(policy_type['Type'] == 'SERVICE_CONTROL_POLICY' and 
+                                   policy_type['Status'] == 'ENABLED' 
+                                   for policy_type in available_types)
+                  
+                  if not scp_enabled:
+                      print("SCP not enabled, enabling it now...")
+                      # Get root ID
+                      roots = organizations.list_roots()
+                      root_id = roots['Roots'][0]['Id']
+                      
+                      # Enable SCP
+                      organizations.enable_policy_type(
+                          RootId=root_id,
+                          PolicyType='SERVICE_CONTROL_POLICY'
+                      )
+                      print("SCP policy type enabled successfully")
+                      
+                      # Wait a bit for the change to propagate
+                      time.sleep(5)
+                  else:
+                      print("SCP policy type is already enabled")
+                      
+              except Exception as e:
+                  print(f"Error enabling SCP: {str(e)}")
+                  raise
+
+          def attach_policy_with_retry(organizations, policy_id, target_id, max_retries=3):
+              """Attach policy with retry mechanism"""
+              for attempt in range(max_retries):
+                  try:
+                      organizations.attach_policy(PolicyId=policy_id, TargetId=target_id)
+                      print(f"Successfully attached policy {policy_id} to {target_id}")
+                      return
+                  except Exception as e:
+                      if "PolicyTypeNotEnabledException" in str(e) and attempt < max_retries - 1:
+                          print(f"Policy type not enabled, retrying in 10 seconds... (attempt {attempt + 1})")
+                          time.sleep(10)
+                          continue
+                      else:
+                          print(f"Error attaching policy {policy_id} to {target_id}: {str(e)}")
+                          raise
 
   # Custom Resource 觸發 Lambda
   InvokeLambda:
