@@ -277,6 +277,7 @@ Resources:
                   - organizations:EnablePolicyType
                   - organizations:DescribeOrganization
                   - organizations:ListRoots
+                  - organizations:ListPolicies
                 Resource: "*"
 
   # Lambda Function (Python)
@@ -287,7 +288,7 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 60
+      Timeout: 300
       Code:
         ZipFile: |
           import json
@@ -313,40 +314,119 @@ Resources:
                   cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
 
           def ensure_scp_enabled(organizations):
-              """Ensure SCP policy type is enabled"""
+              """Ensure SCP policy type is enabled with comprehensive detection"""
               try:
-                  # Get organization info
+                  # Get organization info and root ID first
                   org_info = organizations.describe_organization()
+                  roots = organizations.list_roots()
+                  root_id = roots['Roots'][0]['Id']
+                  
+                  print(f"Organization ID: {org_info['Organization']['Id']}")
+                  print(f"Root ID: {root_id}")
+                  
                   available_types = org_info['Organization']['AvailablePolicyTypes']
+                  print(f"Available policy types: {available_types}")
                   
-                  # Check if SCP is already enabled
-                  scp_enabled = any(policy_type['Type'] == 'SERVICE_CONTROL_POLICY' and 
-                                   policy_type['Status'] == 'ENABLED' 
-                                   for policy_type in available_types)
+                  # More comprehensive SCP status check
+                  scp_enabled = False
+                  scp_exists = False
                   
+                  for policy_type in available_types:
+                      if policy_type['Type'] == 'SERVICE_CONTROL_POLICY':
+                          scp_exists = True
+                          if policy_type['Status'] == 'ENABLED':
+                              scp_enabled = True
+                              print(f"SCP policy type found with status: {policy_type['Status']} - ENABLED")
+                          else:
+                              print(f"SCP policy type found with status: {policy_type['Status']} - NOT ENABLED")
+                          break
+                  
+                  if not scp_exists:
+                      print("SCP policy type not found in available types")
+                  
+                  # Additional verification: Try to list policies to confirm SCP is truly enabled
+                  if scp_enabled:
+                      try:
+                          print("Verifying SCP enablement by attempting to list policies...")
+                          policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                          print(f"Successfully listed {len(policies.get('Policies', []))} SCP policies - SCP is confirmed enabled")
+                          return  # SCP is truly enabled, no need to continue
+                      except Exception as list_error:
+                          print(f"Failed to list SCP policies despite status showing ENABLED: {str(list_error)}")
+                          if "PolicyTypeNotEnabledException" in str(list_error):
+                              print("SCP is not actually enabled despite status - will attempt to enable")
+                              scp_enabled = False
+                          else:
+                              print("Unexpected error listing policies, but continuing with enablement check")
+                  
+                  # If we reach here, SCP needs to be enabled
                   if not scp_enabled:
-                      print("SCP not enabled, enabling it now...")
-                      # Get root ID
-                      roots = organizations.list_roots()
-                      root_id = roots['Roots'][0]['Id']
+                      print("SCP needs to be enabled. Attempting enablement...")
+                      max_attempts = 3
                       
-                      # Enable SCP
-                      organizations.enable_policy_type(
-                          RootId=root_id,
-                          PolicyType='SERVICE_CONTROL_POLICY'
-                      )
-                      print("SCP policy type enabled successfully")
-                      
-                      # Wait a bit for the change to propagate
-                      time.sleep(5)
-                  else:
-                      print("SCP policy type is already enabled")
+                      for attempt in range(max_attempts):
+                          try:
+                              print(f"Enablement attempt {attempt + 1}/{max_attempts}")
+                              
+                              # Enable SCP
+                              enable_response = organizations.enable_policy_type(
+                                  RootId=root_id,
+                                  PolicyType='SERVICE_CONTROL_POLICY'
+                              )
+                              print(f"Enable response: {enable_response}")
+                              
+                              # Wait progressively longer
+                              wait_time = 20 + (attempt * 10)  # 20s, 30s, 40s
+                              print(f"Waiting {wait_time} seconds for SCP enablement to propagate...")
+                              time.sleep(wait_time)
+                              
+                              # Verify enablement by listing policies
+                              try:
+                                  policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                                  print(f"✅ SCP enablement confirmed - can list {len(policies.get('Policies', []))} policies")
+                                  
+                                  # Double-check with describe_organization
+                                  org_info_after = organizations.describe_organization()
+                                  available_types_after = org_info_after['Organization']['AvailablePolicyTypes']
+                                  scp_status_after = next((pt['Status'] for pt in available_types_after if pt['Type'] == 'SERVICE_CONTROL_POLICY'), 'NOT_FOUND')
+                                  print(f"Organization status after enablement: {scp_status_after}")
+                                  
+                                  return  # Successfully enabled
+                                  
+                              except Exception as verify_error:
+                                  print(f"Verification failed on attempt {attempt + 1}: {str(verify_error)}")
+                                  if attempt == max_attempts - 1:
+                                      raise Exception(f"Failed to enable SCP after {max_attempts} attempts. Last error: {str(verify_error)}")
+                                  continue
+                              
+                          except Exception as enable_error:
+                              error_msg = str(enable_error)
+                              print(f"Enable attempt {attempt + 1} failed: {error_msg}")
+                              
+                              if "PolicyTypeAlreadyEnabledException" in error_msg:
+                                  print("SCP was already enabled according to the service")
+                                  # Still verify it works
+                                  try:
+                                      policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                                      print(f"✅ SCP confirmed working - can list {len(policies.get('Policies', []))} policies")
+                                      return
+                                  except Exception as verify_error:
+                                      print(f"SCP shows as enabled but verification failed: {str(verify_error)}")
+                                      if attempt == max_attempts - 1:
+                                          raise Exception(f"SCP shows as enabled but cannot be used: {str(verify_error)}")
+                                      continue
+                              else:
+                                  if attempt == max_attempts - 1:
+                                      raise Exception(f"Failed to enable SCP after {max_attempts} attempts. Last error: {error_msg}")
+                                  time.sleep(10)  # Wait before retry
+                  
+                  print("SCP enablement process completed")
                       
               except Exception as e:
-                  print(f"Error enabling SCP: {str(e)}")
+                  print(f"Error in ensure_scp_enabled: {str(e)}")
                   raise
 
-          def attach_policy_with_retry(organizations, policy_id, target_id, max_retries=3):
+          def attach_policy_with_retry(organizations, policy_id, target_id, max_retries=5):
               """Attach policy with retry mechanism"""
               for attempt in range(max_retries):
                   try:
@@ -355,11 +435,14 @@ Resources:
                       return
                   except Exception as e:
                       if "PolicyTypeNotEnabledException" in str(e) and attempt < max_retries - 1:
-                          print(f"Policy type not enabled, retrying in 10 seconds... (attempt {attempt + 1})")
-                          time.sleep(10)
+                          print(f"Policy type not enabled on attempt {attempt + 1}, waiting longer...")
+                          # Wait longer for SCP to propagate
+                          wait_time = 15 + (attempt * 5)  # Progressive backoff: 15s, 20s, 25s, 30s
+                          print(f"Waiting {wait_time} seconds for SCP to propagate...")
+                          time.sleep(wait_time)
                           continue
                       else:
-                          print(f"Error attaching policy {policy_id} to {target_id}: {str(e)}")
+                          print(f"Error attaching policy {policy_id} to {target_id} after {attempt + 1} attempts: {str(e)}")
                           raise
 
   # Custom Resource 觸發 Lambda

@@ -140,8 +140,11 @@ ERROR: "PolicyTypeNotEnabledException when calling the AttachPolicy operation"
 aws organizations describe-organization --query 'Organization.AvailablePolicyTypes'
 
 # 解决方案 (自动化)
-# ✅ 最新版本的模板已自动处理此问题
-# Lambda函数会自动启用SCP并重试策略附加
+# ✅ 最新版本的模板已全面处理此问题
+# Lambda函数包含增强的SCP检测逻辑：
+# - 通过list_policies验证SCP真实状态
+# - 3次重试机制，渐进式等待时间
+# - 全面的错误处理和状态验证
 
 # 手动解决方案（如果需要）
 ROOT_ID=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
