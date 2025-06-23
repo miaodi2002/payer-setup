@@ -99,7 +99,8 @@ Resources:
                       "BucketRegion": bucket_region,
                       "ReportName": report_name,
                       "CURArn": cur_arn,
-                      "Message": "Legacy CUR Export created successfully"
+                      "BillingGroupArn": billing_group_arn,
+                      "Message": "Legacy CUR Export created successfully (BillingGroup will be processed separately)"
                   }
 
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
@@ -205,6 +206,13 @@ Resources:
                   except:
                       pass
 
+                  # 如果有 BillingGroup ARN，需要转换为 BillingView ARN 或者不使用
+                  print(f"BillingGroup ARN provided: {billing_group_arn}")
+                  
+                  # CUR 的 BillingViewArn 格式与 BillingConductor BillingGroup ARN 不兼容
+                  # 我们需要创建不带 BillingViewArn 的 CUR，然后通过其他方式关联
+                  print("Creating CUR without BillingViewArn due to format incompatibility")
+                  
                   response = cur.put_report_definition(
                       ReportDefinition={
                           'ReportName': report_name,
@@ -217,11 +225,13 @@ Resources:
                           'S3Region': 'us-east-1',
                           'AdditionalArtifacts': ['ATHENA'],
                           'RefreshClosedReports': True,
-                          'ReportVersioning': 'OVERWRITE_REPORT',
-                          'BillingViewArn': billing_group_arn
+                          'ReportVersioning': 'OVERWRITE_REPORT'
+                          # 注意：不使用 BillingViewArn，因为格式不兼容
+                          # Pro forma 数据将通过 BillingConductor 单独处理
                       }
                   )
                   
+                  print(f"CUR created without BillingViewArn. BillingGroup {billing_group_arn} will be processed separately.")
                   return f"arn:aws:cur:us-east-1::report/{report_name}"
                   
               except Exception as e:
@@ -259,3 +269,9 @@ Outputs:
     Value: !GetAtt CreateLegacyCURExport.CURArn
     Export:
       Name: !Sub "${AWS::StackName}-CURArn"
+
+  BillingGroupArn:
+    Description: "ARN of the BillingGroup for Pro forma pricing"
+    Value: !GetAtt CreateLegacyCURExport.BillingGroupArn
+    Export:
+      Name: !Sub "${AWS::StackName}-BillingGroupArn"

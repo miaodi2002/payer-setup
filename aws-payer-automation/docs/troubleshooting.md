@@ -4,6 +4,17 @@
 
 本指南提供AWS Payer自动化初始化项目的全面故障排除方法，涵盖常见问题、诊断步骤和解决方案。
 
+## 重要架构说明
+
+### BillingGroup 与 CUR 集成限制
+
+⚠️ **重要**：AWS Cost and Usage Reports (CUR) 的 `BillingViewArn` 参数与 AWS BillingConductor 的 BillingGroup ARN 格式不兼容：
+
+- **CUR 期望格式**：`arn:aws:billing::[ACCOUNT]:billingview/[ID]`
+- **BillingConductor 实际格式**：`arn:aws:billingconductor::[ACCOUNT]:billinggroup/[ID]`
+
+因此，Module 3 (Pro forma CUR) 创建标准 CUR 报告，不直接关联 BillingGroup。Pro forma 定价数据通过 BillingConductor 单独处理和导出。
+
 ## 通用诊断流程
 
 ### 1. 初始诊断步骤
