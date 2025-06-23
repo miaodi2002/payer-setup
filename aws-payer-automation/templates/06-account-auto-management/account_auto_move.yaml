@@ -5,10 +5,25 @@ Parameters:
   NormalOUId:
     Type: String
     Description: "ID of the Normal OU where accounts should be moved"
+  
+  UseExistingCloudTrail:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Set to 'true' to use existing CloudTrail instead of creating new one"
+  
+  ExistingCloudTrailName:
+    Type: String
+    Default: ""
+    Description: "Name of existing CloudTrail (required if UseExistingCloudTrail is true)"
+
+Conditions:
+  CreateNewCloudTrail: !Equals [!Ref UseExistingCloudTrail, "false"]
 
 Resources:
-  # S3 Bucket for CloudTrail logs
+  # S3 Bucket for CloudTrail logs (only created if new CloudTrail is needed)
   CloudTrailS3Bucket:
+    Condition: CreateNewCloudTrail
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "bip-cloudtrail-bucket-${AWS::AccountId}"
@@ -20,8 +35,9 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
 
-  # S3 Bucket Policy for CloudTrail
+  # S3 Bucket Policy for CloudTrail (only created if new CloudTrail is needed)
   CloudTrailBucketPolicy:
+    Condition: CreateNewCloudTrail
     DependsOn:
       - CloudTrailS3Bucket
     Type: AWS::S3::BucketPolicy
@@ -59,8 +75,9 @@ Resources:
               StringEquals:
                 's3:x-amz-acl': 'bucket-owner-full-control'
 
-  # CloudTrail for Organizations events
+  # CloudTrail for Organizations events (only created if new CloudTrail is needed)
   OrganizationsCloudTrail:
+    Condition: CreateNewCloudTrail
     DependsOn:
       - CloudTrailBucketPolicy
     Type: AWS::CloudTrail::Trail
@@ -295,10 +312,20 @@ Resources:
 
 Outputs:
   CloudTrailBucketName:
-    Description: "S3 bucket name for CloudTrail logs"
+    Condition: CreateNewCloudTrail
+    Description: "S3 bucket name for CloudTrail logs (only available if new CloudTrail was created)"
     Value: !Ref CloudTrailS3Bucket
     Export:
       Name: !Sub "${AWS::StackName}-CloudTrailBucket"
+
+  CloudTrailStatus:
+    Description: "Indicates whether new CloudTrail was created or existing one is used"
+    Value: !If 
+      - CreateNewCloudTrail
+      - "New CloudTrail created"
+      - !Sub "Using existing CloudTrail: ${ExistingCloudTrailName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailStatus"
 
   AccountMoverFunctionArn:
     Description: "ARN of the account mover Lambda function"
