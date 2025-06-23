@@ -26,6 +26,7 @@ Resources:
                   - organizations:DescribeOrganization
                   - organizations:DescribeAccount
                   - organizations:CreateAccount
+                  - organizations:DescribeCreateAccountStatus
                   - organizations:ListAccounts
                   - billingconductor:CreateBillingGroup
                   - billingconductor:AssociatePricingRules
