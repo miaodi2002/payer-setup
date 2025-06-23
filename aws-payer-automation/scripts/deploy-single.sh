@@ -298,27 +298,27 @@ deploy_module6() {
     
     # Get deployment results
     local cloudtrail_status=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailStatus`].OutputValue' --output text)
-    local detection_result=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailDetectionResult`].OutputValue' --output text)
+    local management_result=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailManagementResult`].OutputValue' --output text)
+    local cloudtrail_bucket=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailBucketName`].OutputValue' --output text)
+    local cloudtrail_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailName`].OutputValue' --output text)
     
     print_success "Module 6 deployed successfully: $stack_name"
     print_status "CloudTrail Status: $cloudtrail_status"
+    print_status "CloudTrail Name: $cloudtrail_name"
     
     if [ "$cloudtrail_mode" = "auto" ]; then
-        print_status "Detection Results:"
-        echo "$detection_result" | while IFS= read -r line; do
+        print_status "Management Results:"
+        echo "$management_result" | while IFS= read -r line; do
             print_status "  $line"
         done
     fi
     
     print_warning "Account auto-movement is now active - new accounts will be automatically moved to Normal OU"
     
-    # Show CloudTrail bucket if created
-    local cloudtrail_bucket=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailBucketName`].OutputValue' --output text 2>/dev/null)
+    # Show CloudTrail bucket info
     if [ "$cloudtrail_bucket" != "None" ] && [ -n "$cloudtrail_bucket" ]; then
         print_status "CloudTrail Bucket: $cloudtrail_bucket"
         print_status "Monitor CloudTrail logs in the bucket for account movement activities"
-    else
-        print_status "Make sure existing CloudTrail captures Organizations management events"
     fi
 }
 
