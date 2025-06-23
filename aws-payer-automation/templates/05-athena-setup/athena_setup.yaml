@@ -404,9 +404,9 @@ Resources:
                       pass
 
                   # Lambda函数代码
-                  lambda_code = '''
-import json
-import boto3
+                  lambda_code = |
+                    import json
+                    import boto3
 
 def lambda_handler(event, context):
     glue = boto3.client('glue')
@@ -435,7 +435,7 @@ def lambda_handler(event, context):
             'statusCode': 500,
             'body': json.dumps(f'Error starting crawler: {str(e)}')
         }
-'''
+"""
 
                   # 创建函数
                   response = lambda_client.create_function(
@@ -573,7 +573,7 @@ def lambda_handler(event, context):
                       pass
 
                   # Lambda函数代码
-                  lambda_code = f'''
+                  lambda_code = f"""
 import json
 import boto3
 import urllib.parse
@@ -611,7 +611,7 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f'Error: {{str(e)}}')
         return {{'statusCode': 500, 'body': json.dumps(f'Error: {{str(e)}}')}}
-'''
+"""
 
                   # 创建函数
                   response = lambda_client.create_function(

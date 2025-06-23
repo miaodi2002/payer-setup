@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "CloudFront traffic monitoring with intelligent OAM setup across multiple accounts"
+
+Parameters:
+  PayerName:
+    Type: String
+    Description: "Name of the Payer (e.g., EliteSPP, ELITECLOUD)"
+    
+  MemberAccountIds:
+    Type: CommaDelimitedList
+    Description: "List of member account IDs to monitor (comma-separated)"
+    
+  CloudFrontThresholdMB:
+    Type: Number
+    Default: 100
+    Description: "CloudFront traffic threshold in MB (15-minute window)"
+    
+  TelegramGroupId:
+    Type: String
+    Default: "-862835857"
+    Description: "Telegram group ID for notifications"
+    
+  TelegramApiEndpoint:
+    Type: String
+    Default: "http://3.112.108.101:8509/api/sendout"
+    Description: "Telegram Bot API endpoint"
+
+Resources:
+  # OAM Sink for centralized monitoring in Payer account
+  MonitoringSink:
+    Type: AWS::Oam::Sink
+    Properties:
+      Name: !Sub "${PayerName}-monitoring-sink"
+      Policy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": [
+                "oam:CreateLink",
+                "oam:UpdateLink"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ForAllValues:StringEquals": {
+                  "oam:ResourceTypes": [
+                    "AWS::CloudWatch::Metric",
+                    "AWS::Logs::LogGroup",
+                    "AWS::XRay::Trace",
+                    "AWS::ApplicationInsights::Application",
+                    "AWS::InternetMonitor::Monitor"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+
+  # IAM Role for OAM Setup Lambda
+  OAMSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PayerName}-OAMSetupRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OAMSetupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - oam:*
+                  - sts:AssumeRole
+                  - organizations:ListAccounts
+                  - organizations:DescribeAccount
+                Resource: "*"
+
+  # Lambda function to setup OAM Links in member accounts
+  OAMSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${PayerName}-OAM-Setup"
+      Runtime: ruby2.7
+      Handler: index.setup_handler
+      Role: !GetAtt OAMSetupRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SINK_ARN: !GetAtt MonitoringSink.Arn
+          MEMBER_ACCOUNTS: !Join [",", !Ref MemberAccountIds]
+          PAYER_NAME: !Ref PayerName
+      Code:
+        ZipFile: |
+          require 'json'
+          require 'aws-sdk-oam'
+          require 'aws-sdk-sts'
+          require 'aws-sdk-organizations'
+          
+          def setup_handler(event, context)
+            puts "Starting OAM setup process..."
+            
+            sink_arn = ENV['SINK_ARN']
+            member_accounts = ENV['MEMBER_ACCOUNTS'].split(',')
+            payer_name = ENV['PAYER_NAME']
+            
+            setup_results = []
+            
+            member_accounts.each do |account_id|
+              account_id = account_id.strip
+              next if account_id.empty?
+              
+              result = setup_oam_for_account(account_id, sink_arn, payer_name)
+              setup_results << result
+            end
+            
+            puts "OAM setup completed for #{setup_results.length} accounts"
+            
+            {
+              statusCode: 200,
+              body: JSON.generate({
+                message: "OAM setup completed",
+                results: setup_results
+              })
+            }
+          end
+          
+          def setup_oam_for_account(account_id, sink_arn, payer_name)
+            puts "Setting up OAM for account: #{account_id}"
+            
+            begin
+              # Check if OAM Link already exists
+              if oam_link_exists?(account_id, sink_arn)
+                puts "OAM Link already exists for account #{account_id}"
+                return {
+                  account_id: account_id,
+                  status: "exists",
+                  message: "OAM Link already configured"
+                }
+              end
+              
+              # Assume role in target account
+              assumed_credentials = assume_role_in_account(account_id)
+              
+              # Create OAM Link
+              create_oam_link(assumed_credentials, sink_arn, account_id, payer_name)
+              
+              puts "Successfully created OAM Link for account #{account_id}"
+              
+              {
+                account_id: account_id,
+                status: "created",
+                message: "OAM Link created successfully"
+              }
+              
+            rescue => e
+              puts "Failed to setup OAM for account #{account_id}: #{e.message}"
+              
+              {
+                account_id: account_id,
+                status: "failed",
+                message: e.message
+              }
+            end
+          end
+          
+          def assume_role_in_account(account_id)
+            sts = Aws::STS::Client.new
+            
+            # Try OrganizationAccountAccessRole first
+            role_arn = "arn:aws:iam::#{account_id}:role/OrganizationAccountAccessRole"
+            
+            begin
+              resp = sts.assume_role({
+                role_arn: role_arn,
+                role_session_name: "OAMSetupSession-#{Time.now.to_i}"
+              })
+              
+              {
+                access_key_id: resp.credentials.access_key_id,
+                secret_access_key: resp.credentials.secret_access_key,
+                session_token: resp.credentials.session_token,
+                region: ENV['AWS_REGION'] || 'us-east-1'
+              }
+              
+            rescue => e
+              puts "Failed to assume role in account #{account_id}: #{e.message}"
+              raise "Cannot assume role in account #{account_id}: #{e.message}"
+            end
+          end
+          
+          def create_oam_link(credentials, sink_arn, account_id, payer_name)
+            oam = Aws::Oam::Client.new(credentials)
+            
+            link_name = "#{payer_name}-monitoring-link"
+            
+            response = oam.create_link({
+              label_template: "$AccountName",
+              resource_types: [
+                "AWS::CloudWatch::Metric",
+                "AWS::Logs::LogGroup",
+                "AWS::XRay::Trace",
+                "AWS::ApplicationInsights::Application", 
+                "AWS::InternetMonitor::Monitor"
+              ],
+              sink_identifier: sink_arn,
+              tags: {
+                "PayerName" => payer_name,
+                "Purpose" => "CloudFrontMonitoring",
+                "ManagedBy" => "Module7"
+              }
+            })
+            
+            puts "Created OAM Link: #{response.arn}"
+            response
+          end
+          
+          def oam_link_exists?(account_id, sink_arn)
+            begin
+              # Assume role and check for existing links
+              assumed_credentials = assume_role_in_account(account_id)
+              oam = Aws::Oam::Client.new(assumed_credentials)
+              
+              links = oam.list_links
+              links.items.any? { |link| link.sink_arn == sink_arn }
+              
+            rescue => e
+              puts "Could not check existing OAM links for account #{account_id}: #{e.message}"
+              false
+            end
+          end
+
+  # Custom Resource to trigger OAM setup
+  OAMSetupTrigger:
+    Type: Custom::OAMSetup
+    Properties:
+      ServiceToken: !GetAtt OAMSetupFunction.Arn
+      PayerName: !Ref PayerName
+      MemberAccounts: !Ref MemberAccountIds
+
+  # SNS Topic for CloudFront traffic alerts
+  CloudFrontAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${PayerName}-CloudFront-Traffic-Alerts"
+      DisplayName: !Sub "${PayerName} CloudFront Traffic Monitoring"
+
+  # IAM Role for CloudFront Alert Lambda
+  CloudFrontAlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PayerName}-CloudFrontAlertRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+
+  # Lambda function for CloudFront traffic alerts
+  CloudFrontAlertFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OAMSetupTrigger
+    Properties:
+      FunctionName: !Sub "${PayerName}-CloudFront-Alert"
+      Runtime: ruby2.7
+      Handler: index.alert_handler
+      Role: !GetAtt CloudFrontAlertRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          PAYER_NAME: !Ref PayerName
+          TELEGRAM_GROUP_ID: !Ref TelegramGroupId
+          TELEGRAM_API_ENDPOINT: !Ref TelegramApiEndpoint
+          MEMBER_ACCOUNTS: !Join [",", !Ref MemberAccountIds]
+          THRESHOLD_MB: !Ref CloudFrontThresholdMB
+      Code:
+        ZipFile: |
+          require 'json'
+          require 'net/http'
+          require 'uri'
+          require 'aws-sdk-cloudwatch'
+          require 'time'
+          
+          def alert_handler(event, context)
+            puts "Received CloudWatch alarm event: #{event.to_json}"
+            
+            event['Records'].each do |record|
+              sns_message = record['Sns']['Message']
+              message = JSON.parse(sns_message)
+              
+              # Extract alarm information
+              alarm_name = message['AlarmName']
+              new_state = message['NewStateValue']
+              reason = message['NewStateReason']
+              region = message['Region']
+              
+              puts "Processing alarm: #{alarm_name}, State: #{new_state}"
+              
+              if new_state == 'ALARM'
+                # Find high usage accounts
+                high_usage_accounts = find_high_usage_accounts
+                
+                # Send Telegram alert
+                send_cloudfront_alert(alarm_name, high_usage_accounts, message)
+              end
+            end
+            
+            { statusCode: 200, body: JSON.generate('Success') }
+          end
+          
+          def find_high_usage_accounts
+            cloudwatch = Aws::CloudWatch::Client.new
+            member_accounts = ENV['MEMBER_ACCOUNTS'].split(',')
+            threshold_mb = ENV['THRESHOLD_MB'].to_i
+            threshold_bytes = threshold_mb * 1024 * 1024
+            
+            high_usage = []
+            
+            member_accounts.each do |account_id|
+              account_id = account_id.strip
+              next if account_id.empty?
+              
+              begin
+                # Query CloudFront BytesDownloaded for specific account
+                response = cloudwatch.get_metric_data({
+                  metric_data_queries: [{
+                    id: "cloudfront_#{account_id.gsub('-', '_')}",
+                    metric_stat: {
+                      metric: {
+                        namespace: "AWS/CloudFront",
+                        metric_name: "BytesDownloaded"
+                      },
+                      period: 900, # 15 minutes
+                      stat: "Sum"
+                    },
+                    return_data: true
+                  }],
+                  start_time: Time.now - 900, # Last 15 minutes
+                  end_time: Time.now
+                })
+                
+                if response.metric_data_results.any? && !response.metric_data_results[0].values.empty?
+                  total_bytes = response.metric_data_results[0].values.sum
+                  total_mb = (total_bytes / 1024.0 / 1024.0).round(2)
+                  
+                  if total_bytes > threshold_bytes
+                    high_usage << {
+                      account_id: account_id,
+                      usage_mb: total_mb,
+                      usage_bytes: total_bytes
+                    }
+                  end
+                end
+                
+              rescue => e
+                puts "Error querying account #{account_id}: #{e.message}"
+              end
+            end
+            
+            # Sort by usage descending
+            high_usage.sort_by { |account| -account[:usage_mb] }
+          end
+          
+          def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details)
+            payer_name = ENV['PAYER_NAME']
+            threshold_mb = ENV['THRESHOLD_MB']
+            
+            # Build formatted message
+            message = build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
+            
+            # Send to Telegram
+            send_telegram_message(message)
+          end
+          
+          def build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
+            timestamp = Time.now.utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+            
+            message = "🚨 CloudFront流量告警 - #{payer_name}\n\n"
+            
+            if high_usage_accounts.any?
+              message += "📊 超量账户详情:\n"
+              message += "┌─────────────────────────\n"
+              
+              high_usage_accounts.first(5).each_with_index do |account, index|
+                percentage = ((account[:usage_mb] / threshold_mb.to_f - 1) * 100).round(1)
+                message += "│ #{index + 1}. 账户: #{account[:account_id]}\n"
+                message += "│    用量: #{account[:usage_mb]} MB\n" 
+                message += "│    超出: +#{percentage}%\n"
+                message += "├─────────────────────────\n" unless index == high_usage_accounts.length - 1
+              end
+              
+              message += "└─────────────────────────\n\n"
+              
+              if high_usage_accounts.length > 5
+                message += "📋 另有 #{high_usage_accounts.length - 5} 个账户超限\n\n"
+              end
+            else
+              message += "📊 正在分析具体超量账户...\n\n"
+            end
+            
+            message += "📈 告警信息:\n"
+            message += "• 告警名称: #{alarm_name}\n"
+            message += "• 设定阈值: #{threshold_mb} MB\n"
+            message += "• 监控周期: 15分钟\n"
+            message += "• 告警时间: #{timestamp}\n\n"
+            
+            message += "⚠️ 建议立即检查CloudFront使用情况\n\n"
+            
+            message += "🔗 快速链接:\n"
+            message += "• CloudFront: https://console.aws.amazon.com/cloudfront\n"
+            message += "• CloudWatch: https://console.aws.amazon.com/cloudwatch"
+            
+            message
+          end
+          
+          def send_telegram_message(message)
+            begin
+              uri = URI.parse(ENV['TELEGRAM_API_ENDPOINT'])
+              params = {
+                'group' => ENV['TELEGRAM_GROUP_ID'],
+                'message' => message
+              }
+              
+              request = Net::HTTP::Post.new(uri)
+              request['Content-Type'] = 'application/x-www-form-urlencoded'
+              request.set_form_data(params)
+              
+              response = Net::HTTP.start(uri.hostname, uri.port) do |http|
+                http.request(request)
+              end
+              
+              puts "Telegram API Response: #{response.code} - #{response.body}"
+              
+            rescue => e
+              puts "Failed to send Telegram message: #{e.message}"
+            end
+          end
+
+  # CloudWatch Alarm for CloudFront traffic monitoring
+  CloudFrontTrafficAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: OAMSetupTrigger
+    Properties:
+      AlarmName: !Sub "${PayerName}_CloudFront_Cross_Account_Traffic"
+      AlarmDescription: !Sub "Monitor CloudFront traffic across all ${PayerName} member accounts"
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref CloudFrontAlarmTopic
+      OKActions: []
+      InsufficientDataActions: []
+      Dimensions: []
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref CloudFrontThresholdMB
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      Metrics:
+        - Id: "total_cloudfront"
+          Label: !Sub "${PayerName}_CloudFront_15min_Total"
+          ReturnData: true
+          Expression: 'SELECT SUM(BytesDownloaded) FROM SCHEMA("AWS/CloudFront", DistributionId,Region)'
+          Period: 900
+
+  # Lambda permission for SNS to invoke CloudFront alert function
+  CloudFrontAlertPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CloudFrontAlertFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CloudFrontAlarmTopic
+
+  # SNS subscription to trigger Lambda
+  CloudFrontAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CloudFrontAlarmTopic
+      Endpoint: !GetAtt CloudFrontAlertFunction.Arn
+
+Outputs:
+  MonitoringSinkArn:
+    Description: "ARN of the OAM Sink for centralized monitoring"
+    Value: !GetAtt MonitoringSink.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoringSink"
+      
+  CloudFrontAlarmName:
+    Description: "Name of the CloudFront traffic alarm"
+    Value: !Ref CloudFrontTrafficAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontAlarm"
+      
+  AlertFunctionArn:
+    Description: "ARN of the CloudFront alert Lambda function"
+    Value: !GetAtt CloudFrontAlertFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertFunction"
+      
+  PayerName:
+    Description: "Name of the Payer being monitored"
+    Value: !Ref PayerName
+    Export:
+      Name: !Sub "${AWS::StackName}-PayerName"
+      
+  ThresholdMB:
+    Description: "CloudFront traffic threshold in MB"
+    Value: !Ref CloudFrontThresholdMB
+    Export:
+      Name: !Sub "${AWS::StackName}-Threshold"

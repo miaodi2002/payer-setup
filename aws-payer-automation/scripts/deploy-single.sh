@@ -51,6 +51,8 @@ show_usage() {
     echo "      Parameters: --proforma-bucket <bucket> --risp-bucket <bucket> --proforma-report <name> --risp-report <name>"
     echo "  6 - Account Auto Movement"
     echo "      Parameters: --normal-ou-id <ou_id> [--cloudtrail-mode auto|true|false]"
+    echo "  7 - CloudFront Monitoring"
+    echo "      Parameters: --payer-name <name> --member-accounts <account1,account2> [--threshold-mb <number>] [--telegram-group-id <id>]"
     echo ""
     echo "Examples:"
     echo "  $0 1 --root-id r-abcd1234"
@@ -62,6 +64,8 @@ show_usage() {
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode auto"
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode true"
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode false"
+    echo "  $0 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123"
+    echo "  $0 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123 --threshold-mb 150"
 }
 
 # Function to check if AWS CLI is configured
@@ -322,6 +326,86 @@ deploy_module6() {
     fi
 }
 
+# Function to deploy module 7
+deploy_module7() {
+    local payer_name=$1
+    local member_accounts=$2
+    local threshold_mb=$3
+    local telegram_group_id=$4
+    
+    if [ -z "$payer_name" ]; then
+        print_error "Payer name is required for Module 7"
+        print_status "Example: ./scripts/deploy-single.sh 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123"
+        exit 1
+    fi
+    
+    if [ -z "$member_accounts" ]; then
+        print_error "Member account IDs are required for Module 7"
+        print_status "Example: --member-accounts 123456789012,234567890123,345678901234"
+        exit 1
+    fi
+    
+    # Default values
+    if [ -z "$threshold_mb" ]; then
+        threshold_mb="100"
+    fi
+    
+    if [ -z "$telegram_group_id" ]; then
+        telegram_group_id="-862835857"
+    fi
+    
+    print_status "Deploying Module 7: CloudFront Monitoring"
+    print_status "Payer Name: $payer_name"
+    print_status "Member Accounts: $member_accounts"
+    print_status "Threshold: $threshold_mb MB"
+    print_status "Telegram Group: $telegram_group_id"
+    
+    local stack_name="${STACK_PREFIX}-cloudfront-monitoring-${TIMESTAMP}"
+    
+    # Validate member accounts format
+    if ! echo "$member_accounts" | grep -qE '^[0-9,]+$'; then
+        print_error "Member accounts must be comma-separated account IDs (numbers only)"
+        exit 1
+    fi
+    
+    aws cloudformation create-stack \
+        --stack-name "$stack_name" \
+        --template-body file://templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml \
+        --parameters \
+            ParameterKey=PayerName,ParameterValue="$payer_name" \
+            ParameterKey=MemberAccountIds,ParameterValue="$member_accounts" \
+            ParameterKey=CloudFrontThresholdMB,ParameterValue="$threshold_mb" \
+            ParameterKey=TelegramGroupId,ParameterValue="$telegram_group_id" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION"
+    
+    wait_for_stack "$stack_name" "create"
+    
+    # Get deployment results
+    local monitoring_sink=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' --output text)
+    local alarm_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontAlarmName`].OutputValue' --output text)
+    local alert_function=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`AlertFunctionArn`].OutputValue' --output text)
+    
+    print_success "Module 7 deployed successfully: $stack_name"
+    print_status "OAM Sink ARN: $monitoring_sink"
+    print_status "CloudWatch Alarm: $alarm_name"
+    print_status "Alert Function: $alert_function"
+    
+    print_warning "CloudFront monitoring is now active with ${threshold_mb}MB threshold"
+    print_status "Member accounts: $(echo $member_accounts | tr ',' ' ')"
+    
+    # Show setup results
+    print_status ""
+    print_status "Next steps:"
+    print_status "1. Verify OAM Links are created in member accounts"
+    print_status "2. Test CloudFront traffic monitoring"
+    print_status "3. Monitor Telegram notifications"
+    print_status ""
+    print_status "Monitor CloudWatch Logs:"
+    print_status "  - OAM Setup: /aws/lambda/${payer_name}-OAM-Setup"
+    print_status "  - Alerts: /aws/lambda/${payer_name}-CloudFront-Alert"
+}
+
 # Main function
 main() {
     if [ $# -lt 1 ]; then
@@ -444,6 +528,35 @@ main() {
                 esac
             done
             deploy_module6 "$NORMAL_OU_ID" "$CLOUDTRAIL_MODE"
+            ;;
+        7)
+            # Parse parameters for module 7
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    --payer-name)
+                        PAYER_NAME="$2"
+                        shift 2
+                        ;;
+                    --member-accounts)
+                        MEMBER_ACCOUNTS="$2"
+                        shift 2
+                        ;;
+                    --threshold-mb)
+                        THRESHOLD_MB="$2"
+                        shift 2
+                        ;;
+                    --telegram-group-id)
+                        TELEGRAM_GROUP_ID="$2"
+                        shift 2
+                        ;;
+                    *)
+                        print_error "Unknown parameter: $1"
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+            deploy_module7 "$PAYER_NAME" "$MEMBER_ACCOUNTS" "$THRESHOLD_MB" "$TELEGRAM_GROUP_ID"
             ;;
         *)
             print_error "Invalid module number: $module"

@@ -129,6 +129,8 @@ validate_all_templates() {
         "templates/03-cur-proforma/cur_export_proforma.yaml:Module 3 - Pro forma CUR"
         "templates/04-cur-risp/cur_export_risp.yaml:Module 4 - RISP CUR"
         "templates/05-athena-setup/athena_setup.yaml:Module 5 - Athena Setup"
+        "templates/06-account-auto-management/account_auto_move.yaml:Module 6 - Account Auto Movement"
+        "templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml:Module 7 - CloudFront Monitoring"
     )
     
     local validation_count=0
@@ -187,6 +189,20 @@ validate_dependencies() {
         print_error "Module 5 missing CUR parameter references"
     fi
     
+    # Check if Module 6 references OU parameters correctly
+    if grep -q "NormalOUId" templates/06-account-auto-management/account_auto_move.yaml; then
+        print_success "Module 6 correctly references Normal OU parameter"
+    else
+        print_error "Module 6 missing Normal OU parameter reference"
+    fi
+    
+    # Check if Module 7 has OAM and monitoring components
+    if grep -q "AWS::Oam::Sink\|AWS::CloudWatch::Alarm" templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml; then
+        print_success "Module 7 correctly includes OAM and monitoring components"
+    else
+        print_error "Module 7 missing OAM or monitoring components"
+    fi
+    
     # Check if templates exist
     local required_files=(
         "templates/01-ou-scp/auto_SCP_1.yaml"
@@ -194,6 +210,8 @@ validate_dependencies() {
         "templates/03-cur-proforma/cur_export_proforma.yaml"
         "templates/04-cur-risp/cur_export_risp.yaml"
         "templates/05-athena-setup/athena_setup.yaml"
+        "templates/06-account-auto-management/account_auto_move.yaml"
+        "templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml"
     )
     
     for file in "${required_files[@]}"; do
