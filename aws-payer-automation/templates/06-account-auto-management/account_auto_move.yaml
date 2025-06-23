@@ -6,25 +6,21 @@ Parameters:
     Type: String
     Description: "ID of the Normal OU where accounts should be moved"
   
-  UseExistingCloudTrail:
+  CreateCloudTrail:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: "Set to 'true' to use existing CloudTrail instead of creating new one"
-  
-  ExistingCloudTrailName:
-    Type: String
-    Default: ""
-    Description: "Name of existing CloudTrail (required if UseExistingCloudTrail is true)"
+    Description: "Set to 'true' to create new CloudTrail (default: false, assumes CloudTrail exists)"
 
 Conditions:
-  CreateNewCloudTrail: !Equals [!Ref UseExistingCloudTrail, "false"]
+  CreateNewCloudTrail: !Equals [!Ref CreateCloudTrail, "true"]
 
 Resources:
   # S3 Bucket for CloudTrail logs (only created if new CloudTrail is needed)
   CloudTrailS3Bucket:
     Condition: CreateNewCloudTrail
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
     Properties:
       BucketName: !Sub "bip-cloudtrail-bucket-${AWS::AccountId}"
       PublicAccessBlockConfiguration:
@@ -323,7 +319,7 @@ Outputs:
     Value: !If 
       - CreateNewCloudTrail
       - "New CloudTrail created"
-      - !Sub "Using existing CloudTrail: ${ExistingCloudTrailName}"
+      - "Using existing CloudTrail infrastructure"
     Export:
       Name: !Sub "${AWS::StackName}-CloudTrailStatus"
 
