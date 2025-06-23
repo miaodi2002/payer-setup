@@ -176,6 +176,9 @@ Resources:
                       Name='Bills',
                       Description='Billing group for customer original pricing',
                       PrimaryAccountId=primary_account_id,
+                      AccountGrouping={
+                          'LinkedAccountIds': [primary_account_id]
+                      },
                       ComputationPreference={
                           'PricingPlanArn': 'arn:aws:billingconductor::aws:pricing-plan/AWS_STANDARD'
                       }
