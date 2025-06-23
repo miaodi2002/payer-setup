@@ -8,14 +8,138 @@ Parameters:
   
   CreateCloudTrail:
     Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: "Set to 'true' to create new CloudTrail (default: false, assumes CloudTrail exists)"
+    Default: "auto"
+    AllowedValues: ["auto", "true", "false"]
+    Description: "CloudTrail creation mode: auto (detect and create if needed), true (force create), false (skip creation)"
 
 Conditions:
-  CreateNewCloudTrail: !Equals [!Ref CreateCloudTrail, "true"]
+  CreateNewCloudTrail: !Or
+    - !Equals [!Ref CreateCloudTrail, "true"]
+    - !And
+      - !Equals [!Ref CreateCloudTrail, "auto"]
+      - !Equals [!GetAtt CloudTrailDetector.ShouldCreateCloudTrail, "true"]
+  SkipCloudTrail: !Equals [!Ref CreateCloudTrail, "false"]
 
 Resources:
+  # Lambda role for CloudTrail detection
+  CloudTrailDetectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudTrailDetectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:HeadBucket
+                  - s3:ListBucket
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetEventSelectors
+                Resource: "*"
+
+  # Lambda function to detect existing CloudTrail infrastructure
+  CloudTrailDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CloudTrailDetector"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CloudTrailDetectorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  account_id = context.invoked_function_arn.split(':')[4]
+                  bucket_name = f"bip-cloudtrail-bucket-{account_id}"
+                  
+                  s3 = boto3.client('s3')
+                  cloudtrail = boto3.client('cloudtrail')
+                  
+                  # Check if S3 bucket exists
+                  bucket_exists = False
+                  try:
+                      s3.head_bucket(Bucket=bucket_name)
+                      bucket_exists = True
+                      print(f"S3 bucket {bucket_name} exists")
+                  except Exception as e:
+                      print(f"S3 bucket {bucket_name} does not exist: {str(e)}")
+                  
+                  # Check if CloudTrail exists and is logging Organizations events
+                  suitable_cloudtrail = False
+                  try:
+                      trails = cloudtrail.describe_trails()
+                      for trail in trails['trailList']:
+                          if trail.get('IsLogging', False):
+                              # Check event selectors
+                              try:
+                                  selectors = cloudtrail.get_event_selectors(TrailName=trail['Name'])
+                                  for selector in selectors.get('EventSelectors', []):
+                                      if (selector.get('IncludeManagementEvents', False) and 
+                                          selector.get('ReadWriteType') in ['All', 'WriteOnly']):
+                                          suitable_cloudtrail = True
+                                          print(f"Found suitable CloudTrail: {trail['Name']}")
+                                          break
+                              except Exception as e:
+                                  print(f"Could not check event selectors for {trail['Name']}: {str(e)}")
+                          if suitable_cloudtrail:
+                              break
+                  except Exception as e:
+                      print(f"Error checking CloudTrails: {str(e)}")
+                  
+                  # Decision logic
+                  should_create = "false"
+                  reason = ""
+                  
+                  if not bucket_exists and not suitable_cloudtrail:
+                      should_create = "true"
+                      reason = "No CloudTrail infrastructure found"
+                  elif bucket_exists and not suitable_cloudtrail:
+                      should_create = "false" 
+                      reason = "S3 bucket exists but no suitable CloudTrail - manual intervention needed"
+                  elif suitable_cloudtrail:
+                      should_create = "false"
+                      reason = "Suitable CloudTrail already exists"
+                  
+                  response_data = {
+                      "ShouldCreateCloudTrail": should_create,
+                      "BucketExists": str(bucket_exists).lower(),
+                      "SuitableCloudTrailExists": str(suitable_cloudtrail).lower(),
+                      "Reason": reason,
+                      "BucketName": bucket_name
+                  }
+                  
+                  print(f"Decision: {response_data}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  # Custom resource to detect CloudTrail infrastructure
+  CloudTrailDetector:
+    Type: Custom::CloudTrailDetector
+    Properties:
+      ServiceToken: !GetAtt CloudTrailDetectorFunction.Arn
+
   # S3 Bucket for CloudTrail logs (only created if new CloudTrail is needed)
   CloudTrailS3Bucket:
     Condition: CreateNewCloudTrail
@@ -315,13 +439,23 @@ Outputs:
       Name: !Sub "${AWS::StackName}-CloudTrailBucket"
 
   CloudTrailStatus:
-    Description: "Indicates whether new CloudTrail was created or existing one is used"
+    Description: "CloudTrail configuration status"
     Value: !If 
       - CreateNewCloudTrail
       - "New CloudTrail created"
-      - "Using existing CloudTrail infrastructure"
+      - !Sub "${CloudTrailDetector.Reason}"
     Export:
       Name: !Sub "${AWS::StackName}-CloudTrailStatus"
+
+  CloudTrailDetectionResult:
+    Description: "CloudTrail infrastructure detection results"
+    Value: !Sub |
+      ShouldCreate: ${CloudTrailDetector.ShouldCreateCloudTrail}
+      BucketExists: ${CloudTrailDetector.BucketExists}  
+      SuitableCloudTrailExists: ${CloudTrailDetector.SuitableCloudTrailExists}
+      Reason: ${CloudTrailDetector.Reason}
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailDetection"
 
   AccountMoverFunctionArn:
     Description: "ARN of the account mover Lambda function"

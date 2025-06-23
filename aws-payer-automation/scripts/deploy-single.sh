@@ -50,7 +50,7 @@ show_usage() {
     echo "  5 - Athena Setup"
     echo "      Parameters: --proforma-bucket <bucket> --risp-bucket <bucket> --proforma-report <name> --risp-report <name>"
     echo "  6 - Account Auto Movement"
-    echo "      Parameters: --normal-ou-id <ou_id> [--create-cloudtrail]"
+    echo "      Parameters: --normal-ou-id <ou_id> [--cloudtrail-mode auto|true|false]"
     echo ""
     echo "Examples:"
     echo "  $0 1 --root-id r-abcd1234"
@@ -59,7 +59,9 @@ show_usage() {
     echo "  $0 4"
     echo "  $0 5 --proforma-bucket bip-cur-123456789012 --risp-bucket bip-risp-cur-123456789012 --proforma-report 123456789012 --risp-report risp-123456789012"
     echo "  $0 6 --normal-ou-id ou-abcd-12345678"
-    echo "  $0 6 --normal-ou-id ou-abcd-12345678 --create-cloudtrail"
+    echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode auto"
+    echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode true"
+    echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode false"
 }
 
 # Function to check if AWS CLI is configured
@@ -251,7 +253,7 @@ deploy_module5() {
 # Function to deploy module 6
 deploy_module6() {
     local normal_ou_id=$1
-    local create_cloudtrail=$2
+    local cloudtrail_mode=$2
     
     if [ -z "$normal_ou_id" ]; then
         print_error "Normal OU ID is required for Module 6"
@@ -260,19 +262,30 @@ deploy_module6() {
         exit 1
     fi
     
+    # Default to auto mode if not specified
+    if [ -z "$cloudtrail_mode" ]; then
+        cloudtrail_mode="auto"
+    fi
+    
     print_status "Deploying Module 6: Account Auto Movement"
     print_status "Normal OU ID: $normal_ou_id"
+    print_status "CloudTrail Mode: $cloudtrail_mode"
     
     local stack_name="${STACK_PREFIX}-account-auto-move-${TIMESTAMP}"
     local parameters="ParameterKey=NormalOUId,ParameterValue=$normal_ou_id"
+    parameters="$parameters ParameterKey=CreateCloudTrail,ParameterValue=$cloudtrail_mode"
     
-    if [ "$create_cloudtrail" = "true" ]; then
-        print_status "Will create new CloudTrail for Organizations events"
-        parameters="$parameters ParameterKey=CreateCloudTrail,ParameterValue=true"
-    else
-        print_status "Will use existing CloudTrail infrastructure (default)"
-        parameters="$parameters ParameterKey=CreateCloudTrail,ParameterValue=false"
-    fi
+    case $cloudtrail_mode in
+        "auto")
+            print_status "Auto mode: Will detect existing CloudTrail and create if needed"
+            ;;
+        "true")
+            print_status "Force mode: Will create new CloudTrail for Organizations events"
+            ;;
+        "false")
+            print_status "Skip mode: Will not create CloudTrail (assumes existing infrastructure)"
+            ;;
+    esac
     
     aws cloudformation create-stack \
         --stack-name "$stack_name" \
@@ -283,21 +296,28 @@ deploy_module6() {
     
     wait_for_stack "$stack_name" "create"
     
-    # Get CloudTrail status for reference
+    # Get deployment results
     local cloudtrail_status=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailStatus`].OutputValue' --output text)
+    local detection_result=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailDetectionResult`].OutputValue' --output text)
     
     print_success "Module 6 deployed successfully: $stack_name"
     print_status "CloudTrail Status: $cloudtrail_status"
+    
+    if [ "$cloudtrail_mode" = "auto" ]; then
+        print_status "Detection Results:"
+        echo "$detection_result" | while IFS= read -r line; do
+            print_status "  $line"
+        done
+    fi
+    
     print_warning "Account auto-movement is now active - new accounts will be automatically moved to Normal OU"
     
-    if [ "$create_cloudtrail" = "true" ]; then
-        local cloudtrail_bucket=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailBucketName`].OutputValue' --output text 2>/dev/null)
-        if [ "$cloudtrail_bucket" != "None" ] && [ -n "$cloudtrail_bucket" ]; then
-            print_status "CloudTrail Bucket: $cloudtrail_bucket"
-            print_status "Monitor CloudTrail logs in the bucket for account movement activities"
-        fi
+    # Show CloudTrail bucket if created
+    local cloudtrail_bucket=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailBucketName`].OutputValue' --output text 2>/dev/null)
+    if [ "$cloudtrail_bucket" != "None" ] && [ -n "$cloudtrail_bucket" ]; then
+        print_status "CloudTrail Bucket: $cloudtrail_bucket"
+        print_status "Monitor CloudTrail logs in the bucket for account movement activities"
     else
-        print_status "Using existing CloudTrail infrastructure"
         print_status "Make sure existing CloudTrail captures Organizations management events"
     fi
 }
@@ -396,15 +416,24 @@ main() {
             ;;
         6)
             # Parse parameters for module 6
-            CREATE_CLOUDTRAIL="false"
+            CLOUDTRAIL_MODE="auto"
             while [[ $# -gt 0 ]]; do
                 case $1 in
                     --normal-ou-id)
                         NORMAL_OU_ID="$2"
                         shift 2
                         ;;
+                    --cloudtrail-mode)
+                        CLOUDTRAIL_MODE="$2"
+                        if [[ ! "$CLOUDTRAIL_MODE" =~ ^(auto|true|false)$ ]]; then
+                            print_error "Invalid cloudtrail-mode: $CLOUDTRAIL_MODE. Must be auto, true, or false"
+                            exit 1
+                        fi
+                        shift 2
+                        ;;
+                    # Legacy support for --create-cloudtrail
                     --create-cloudtrail)
-                        CREATE_CLOUDTRAIL="true"
+                        CLOUDTRAIL_MODE="true"
                         shift
                         ;;
                     *)
@@ -414,7 +443,7 @@ main() {
                         ;;
                 esac
             done
-            deploy_module6 "$NORMAL_OU_ID" "$CREATE_CLOUDTRAIL"
+            deploy_module6 "$NORMAL_OU_ID" "$CLOUDTRAIL_MODE"
             ;;
         *)
             print_error "Invalid module number: $module"
