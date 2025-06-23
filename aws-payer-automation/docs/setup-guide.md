@@ -498,6 +498,269 @@ aws cloudtrail get-trail-status --name bip-organizations-management-trail
 aws cloudtrail get-event-selectors --trail-name bip-organizations-management-trail
 ```
 
+### Step 7: 部署CloudFront跨账户监控（Module 7）
+
+#### 7.1 前置条件检查
+```bash
+# 验证OAM权限
+if aws oam list-sinks &> /dev/null; then
+    echo "✓ OAM access confirmed"
+else
+    echo "✗ OAM access denied - check IAM permissions"
+    exit 1
+fi
+
+# 获取所有成员账户ID
+MEMBER_ACCOUNTS=$(aws organizations list-accounts \
+  --query 'Accounts[?Status==`ACTIVE`].Id' \
+  --output text | tr '\t' ',')
+
+echo "Member Accounts: $MEMBER_ACCOUNTS"
+
+# 验证OrganizationAccountAccessRole存在（抽查一个账户）
+FIRST_ACCOUNT=$(echo $MEMBER_ACCOUNTS | cut -d',' -f1)
+aws sts assume-role \
+  --role-arn arn:aws:iam::$FIRST_ACCOUNT:role/OrganizationAccountAccessRole \
+  --role-session-name OAMTestSession &> /dev/null
+
+if [ $? -eq 0 ]; then
+    echo "✓ Cross-account access role verified"
+else
+    echo "⚠ Warning: Cross-account access may be limited"
+fi
+```
+
+#### 7.2 部署执行
+
+##### 基本部署（推荐）
+```bash
+# 使用默认100MB阈值
+./scripts/deploy-single.sh 7 \
+  --payer-name EliteSPP \
+  --member-accounts $MEMBER_ACCOUNTS
+```
+
+##### 自定义配置部署
+```bash
+# 自定义阈值和Telegram群组
+./scripts/deploy-single.sh 7 \
+  --payer-name EliteSPP \
+  --member-accounts $MEMBER_ACCOUNTS \
+  --threshold-mb 150 \
+  --telegram-group-id -862835857
+```
+
+##### 手动部署（如需要）
+```bash
+# 手动指定账户列表
+./scripts/deploy-single.sh 7 \
+  --payer-name EliteSPP \
+  --member-accounts 123456789012,234567890123,345678901234 \
+  --threshold-mb 100
+```
+
+#### 7.3 验证CloudFront监控设置
+
+##### 验证CloudFormation栈
+```bash
+# 检查栈状态
+STACK_NAME=$(aws cloudformation list-stacks \
+  --query 'StackSummaries[?starts_with(StackName, `payer-cloudfront-monitoring-`)].StackName' \
+  --output text)
+
+aws cloudformation describe-stacks --stack-name $STACK_NAME
+
+# 获取栈输出
+aws cloudformation describe-stacks \
+  --stack-name $STACK_NAME \
+  --query 'Stacks[0].Outputs'
+```
+
+##### 验证OAM基础设施
+```bash
+# 检查OAM Sink
+aws oam list-sinks
+
+# 检查OAM设置日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --start-time $(date -d '30 minutes ago' +%s)000
+
+# 验证成员账户OAM Link（抽查）
+echo "Checking OAM Links in member accounts..."
+for account in $(echo $MEMBER_ACCOUNTS | tr ',' ' ' | head -3); do
+    echo "Checking account: $account"
+    # 这需要在成员账户中执行，或通过跨账户角色
+    aws sts assume-role \
+      --role-arn arn:aws:iam::$account:role/OrganizationAccountAccessRole \
+      --role-session-name OAMCheck &> /dev/null && echo "  ✓ Access OK" || echo "  ⚠ Access limited"
+done
+```
+
+##### 验证CloudWatch告警
+```bash
+# 检查CloudFront告警
+aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
+
+# 查看告警配置详情
+aws cloudwatch describe-alarms \
+  --alarm-names "EliteSPP_CloudFront_Cross_Account_Traffic" \
+  --query 'MetricAlarms[0].{Threshold:Threshold,Period:Period,MetricExpression:Metrics[0].Expression}'
+
+# 检查SNS Topic
+aws sns list-topics | grep CloudFront
+```
+
+##### 验证Lambda函数
+```bash
+# 检查Lambda函数状态
+aws lambda get-function --function-name EliteSPP-OAM-Setup \
+  --query 'Configuration.{State:State,LastModified:LastModified}'
+
+aws lambda get-function --function-name EliteSPP-CloudFront-Alert \
+  --query 'Configuration.{State:State,LastModified:LastModified}'
+
+# 查看环境变量配置
+aws lambda get-function-configuration --function-name EliteSPP-CloudFront-Alert \
+  --query 'Environment.Variables'
+```
+
+#### 7.4 测试和验证
+
+##### 功能测试
+```bash
+# 测试CloudFront指标查询
+aws cloudwatch list-metrics \
+  --namespace AWS/CloudFront \
+  --metric-name BytesDownloaded
+
+# 手动测试告警Lambda（可选）
+cat > test-alarm.json << 'EOF'
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"AlarmName\":\"EliteSPP_CloudFront_Cross_Account_Traffic\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Test alarm\",\"Region\":\"us-east-1\"}"
+      }
+    }
+  ]
+}
+EOF
+
+aws lambda invoke \
+  --function-name EliteSPP-CloudFront-Alert \
+  --payload file://test-alarm.json \
+  response.json
+
+cat response.json
+rm test-alarm.json response.json
+```
+
+##### Telegram通知测试
+```bash
+# 测试Telegram API连通性
+curl -X POST http://3.112.108.101:8509/api/sendout \
+  -d "group=-862835857&message=Module 7 部署测试 - CloudFront监控系统已启动" \
+  -H "Content-Type: application/x-www-form-urlencoded"
+```
+
+#### 7.5 监控和日志
+
+##### 查看部署日志
+```bash
+# OAM设置日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --start-time $(date -d '1 hour ago' +%s)000 \
+  --filter-pattern "Successfully created OAM Link"
+
+# 告警处理日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --start-time $(date -d '24 hours ago' +%s)000
+
+# CloudFormation事件
+aws cloudformation describe-stack-events \
+  --stack-name $STACK_NAME \
+  --max-items 10
+```
+
+##### 持续监控命令
+```bash
+# 创建监控脚本
+cat > monitor-cloudfront.sh << 'EOF'
+#!/bin/bash
+echo "=== CloudFront监控状态检查 ==="
+echo "时间: $(date)"
+
+# 检查告警状态
+echo "1. CloudWatch告警状态:"
+aws cloudwatch describe-alarms \
+  --alarm-names "EliteSPP_CloudFront_Cross_Account_Traffic" \
+  --query 'MetricAlarms[0].{State:StateValue,Reason:StateReason}' \
+  --output table
+
+# 检查OAM Sink
+echo "2. OAM Sink状态:"
+aws oam list-sinks --query 'Items[0].{Name:Name,Arn:Arn}' --output table
+
+# 检查最近告警日志
+echo "3. 最近1小时告警日志:"
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --start-time $(date -d '1 hour ago' +%s)000 \
+  --query 'events[].message' \
+  --output text | head -5
+
+echo "=== 检查完成 ==="
+EOF
+
+chmod +x monitor-cloudfront.sh
+```
+
+#### 7.6 故障排除
+
+##### 常见问题诊断
+```bash
+# 1. OAM Link创建失败
+echo "检查OrganizationAccountAccessRole:"
+for account in $(echo $MEMBER_ACCOUNTS | tr ',' ' ' | head -3); do
+    echo "Account: $account"
+    aws sts assume-role \
+      --role-arn arn:aws:iam::$account:role/OrganizationAccountAccessRole \
+      --role-session-name DiagnosticCheck \
+      --duration-seconds 900 &> /dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Cross-account access OK"
+    else
+        echo "  ✗ Cross-account access failed"
+        echo "  解决方案: 检查Organizations信任关系或手动创建角色"
+    fi
+done
+
+# 2. CloudWatch告警不触发
+echo "检查CloudFront指标可用性:"
+metrics_count=$(aws cloudwatch list-metrics \
+  --namespace AWS/CloudFront \
+  --metric-name BytesDownloaded \
+  --query 'length(Metrics)' \
+  --output text)
+
+if [ "$metrics_count" -gt 0 ]; then
+    echo "✓ CloudFront指标可用 ($metrics_count 个指标)"
+else
+    echo "⚠ 警告: 未发现CloudFront指标，可能需要等待数据生成"
+fi
+
+# 3. Telegram通知问题
+echo "检查Telegram配置:"
+aws lambda get-function-configuration \
+  --function-name EliteSPP-CloudFront-Alert \
+  --query 'Environment.Variables.{Group:TELEGRAM_GROUP_ID,Endpoint:TELEGRAM_API_ENDPOINT}' \
+  --output table
+```
+
 ## 验证和测试
 
 ### 1. 完整性检查
@@ -541,6 +804,14 @@ aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `Account
 
 # 验证CloudTrail（Module 6）
 aws cloudtrail describe-trails
+
+# 验证OAM基础设施（Module 7）
+aws oam list-sinks
+aws oam list-links
+
+# 验证CloudFront监控（Module 7）
+aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
+aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `EliteSPP-`)].FunctionName'
 ```
 
 ### 2. 功能测试
