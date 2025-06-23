@@ -283,19 +283,28 @@ Resources:
                   if billing_view_arn:
                       billing_group_attempts.append({'BillingViewArn': billing_view_arn})
                   
-                  # 添加其他尝试方法，基于AWS的正则表达式要求
+                  # 基于控制台网络请求的正确格式！
+                  billing_group_id = billing_group_arn.split('/')[-1]  # 提取ID: 734908905472
+                  correct_billing_view_name = f"billing-group-{billing_group_id}"  # billing-group-734908905472
+                  correct_billing_view_arn = f"arn:aws:billing::{account_id}:billingview/{correct_billing_view_name}"
+                  
+                  print(f"🎯 Using CORRECT format from console analysis:")
+                  print(f"   BillingGroup ID: {billing_group_id}")
+                  print(f"   BillingView name: {correct_billing_view_name}")
+                  print(f"   BillingView ARN: {correct_billing_view_arn}")
+                  
                   billing_group_attempts.extend([
-                      # 尝试1: 构造正确的billing view ARN格式，使用正确的BillingGroup名称
+                      # 尝试1: 使用从控制台发现的正确格式！
+                      {'BillingViewArn': correct_billing_view_arn},
+                      # 尝试2: 仅使用正确的billing view名称
+                      {'BillingViewArn': correct_billing_view_name},
+                      # 尝试3: 使用BillingGroup名称（备选）
                       {'BillingViewArn': f"arn:aws:billing::{account_id}:billingview/{billing_group_name}"},
-                      # 尝试2: 仅使用BillingGroup名称（最简单的格式）
+                      # 尝试4: 仅使用BillingGroup名称
                       {'BillingViewArn': billing_group_name},
-                      # 尝试3: 尝试不同的区域格式
-                      {'BillingViewArn': f"arn:aws-cn:billing::{account_id}:billingview/{billing_group_name}"},
-                      # 尝试4: 尝试没有ARN前缀的格式，只用名称
-                      {'BillingViewArn': f"{billing_group_name}"},
-                      # 尝试5: 尝试将ID作为名称使用（以防万一）
-                      {'BillingViewArn': billing_group_arn.split('/')[-1]},
-                      # 尝试6: 尝试不提供BillingViewArn参数（完全省略）
+                      # 尝试5: 使用原始ID
+                      {'BillingViewArn': billing_group_id},
+                      # 尝试6: 不提供参数（标准CUR）
                       {}
                   ])
                   
@@ -338,12 +347,19 @@ Resources:
                                   used_billing_view = billing_param.get('BillingViewArn', 'NOT_PROVIDED')
                                   print(f"Used parameter: {used_billing_view}, Got result: {billing_view}")
                                   
-                                  # 如果我们提供了BillingViewArn且结果匹配（或者结果包含Bills等关键词）
-                                  if (used_billing_view != 'NOT_PROVIDED' and 
-                                      (billing_view == used_billing_view or 
-                                       (billing_view and billing_view != 'NOT_SET' and 'bills' in str(billing_view).lower()))):
+                                  # 检查是否成功关联BillingGroup (基于控制台分析的模式)
+                                  success_indicators = [
+                                      billing_view == used_billing_view,  # 精确匹配
+                                      (billing_view and 'billing-group-' in str(billing_view)),  # 包含billing-group-模式
+                                      (billing_view and billing_group_id in str(billing_view)),  # 包含BillingGroup ID
+                                      (billing_view and billing_group_name.lower() in str(billing_view).lower())  # 包含BillingGroup名称
+                                  ]
+                                  
+                                  if (used_billing_view != 'NOT_PROVIDED' and any(success_indicators)):
                                       print(f"🎉 Successfully created Legacy CUR with Pro forma pricing!")
+                                      print(f"Used parameter: {used_billing_view}")
                                       print(f"Final BillingViewArn: {billing_view}")
+                                      print(f"This matches the console format: billing-group-{billing_group_id}")
                                       return f"arn:aws:cur:us-east-1::report/{report_name}"
                                   elif used_billing_view == 'NOT_PROVIDED':
                                       print(f"⚠️ CUR created without BillingViewArn parameter, checking if it's acceptable...")
