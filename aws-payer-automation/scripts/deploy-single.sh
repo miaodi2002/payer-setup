@@ -49,6 +49,8 @@ show_usage() {
     echo "      Parameters: none"
     echo "  5 - Athena Setup"
     echo "      Parameters: --proforma-bucket <bucket> --risp-bucket <bucket> --proforma-report <name> --risp-report <name>"
+    echo "  6 - Account Auto Movement"
+    echo "      Parameters: --normal-ou-id <ou_id>"
     echo ""
     echo "Examples:"
     echo "  $0 1 --root-id r-abcd1234"
@@ -56,6 +58,7 @@ show_usage() {
     echo "  $0 3 --billing-group-arn arn:aws:billingconductor::123456789012:billinggroup/12345678"
     echo "  $0 4"
     echo "  $0 5 --proforma-bucket bip-cur-123456789012 --risp-bucket bip-risp-cur-123456789012 --proforma-report 123456789012 --risp-report risp-123456789012"
+    echo "  $0 6 --normal-ou-id ou-abcd-12345678"
 }
 
 # Function to check if AWS CLI is configured
@@ -244,6 +247,40 @@ deploy_module5() {
     print_status "Use this database name for querying CUR data in Athena"
 }
 
+# Function to deploy module 6
+deploy_module6() {
+    local normal_ou_id=$1
+    
+    if [ -z "$normal_ou_id" ]; then
+        print_error "Normal OU ID is required for Module 6"
+        print_status "You can get it from Module 1 stack outputs:"
+        print_status "aws cloudformation describe-stacks --stack-name payer-ou-scp-* --query 'Stacks[0].Outputs[?OutputKey==\`NormalOUId\`].OutputValue' --output text"
+        exit 1
+    fi
+    
+    print_status "Deploying Module 6: Account Auto Movement"
+    print_status "Normal OU ID: $normal_ou_id"
+    
+    local stack_name="${STACK_PREFIX}-account-auto-move-${TIMESTAMP}"
+    
+    aws cloudformation create-stack \
+        --stack-name "$stack_name" \
+        --template-body file://templates/06-account-auto-management/account_auto_move.yaml \
+        --parameters ParameterKey=NormalOUId,ParameterValue="$normal_ou_id" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION"
+    
+    wait_for_stack "$stack_name" "create"
+    
+    # Get CloudTrail bucket for reference
+    local cloudtrail_bucket=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudTrailBucketName`].OutputValue' --output text)
+    
+    print_success "Module 6 deployed successfully: $stack_name"
+    print_status "CloudTrail Bucket: $cloudtrail_bucket"
+    print_warning "Account auto-movement is now active - new accounts will be automatically moved to Normal OU"
+    print_status "Monitor CloudTrail logs in the bucket for account movement activities"
+}
+
 # Main function
 main() {
     if [ $# -lt 1 ]; then
@@ -335,6 +372,23 @@ main() {
                 esac
             done
             deploy_module5 "$PROFORMA_BUCKET" "$RISP_BUCKET" "$PROFORMA_REPORT" "$RISP_REPORT"
+            ;;
+        6)
+            # Parse parameters for module 6
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    --normal-ou-id)
+                        NORMAL_OU_ID="$2"
+                        shift 2
+                        ;;
+                    *)
+                        print_error "Unknown parameter: $1"
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+            deploy_module6 "$NORMAL_OU_ID"
             ;;
         *)
             print_error "Invalid module number: $module"

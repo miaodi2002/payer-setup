@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-由于AWS 6月政策变更，不再允许RISP跨客户共享，需要为每个客户创建独立Payer。本项目提供基于CloudFormation + Lambda的模块化自动化方案，包含4个核心模块，实现AWS Reseller Payer账户的完全自动化初始化。
+由于AWS 6月政策变更，不再允许RISP跨客户共享，需要为每个客户创建独立Payer。本项目提供基于CloudFormation + Lambda的模块化自动化方案，包含6个核心模块，实现AWS Reseller Payer账户的完全自动化初始化。
 
 ## 架构图
 
@@ -62,6 +62,12 @@
 - 设置Lambda函数处理自动化数据发现
 - 配置S3事件通知自动触发数据更新
 - 创建状态表跟踪CUR数据生成状态
+
+### Module 6: 账户自动移动
+- 监控AWS Organizations事件（CreateAccountResult、AcceptHandshake）
+- 自动将新加入的账户移动到Normal OU
+- 应用SCP限制防止购买预付费服务
+- CloudTrail日志记录所有账户移动活动
 
 ## 快速开始
 
@@ -123,6 +129,29 @@ BILLING_GROUP_ARN=$(aws cloudformation describe-stacks \
 
 # 部署Module 4
 ./scripts/deploy-single.sh 4
+
+# 获取ProformaBucket等参数并部署Module 5
+PROFORMA_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-proforma-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
+  --output text)
+
+RISP_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-risp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`RISPBucketName`].OutputValue' \
+  --output text)
+
+# 部署Module 5
+./scripts/deploy-single.sh 5 --proforma-bucket $PROFORMA_BUCKET --risp-bucket $RISP_BUCKET --proforma-report $ACCOUNT_ID --risp-report risp-$ACCOUNT_ID
+
+# 获取Normal OU ID并部署Module 6
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+# 部署Module 6
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID
 ```
 
 ## 项目结构
@@ -143,8 +172,11 @@ aws-payer-automation/
 │   ├── 04-cur-risp/
 │   │   ├── cur_export_risp.yaml # RISP CUR
 │   │   └── README.md
-│   └── 05-athena-setup/
-│       ├── athena_setup.yaml    # Athena环境设置
+│   ├── 05-athena-setup/
+│   │   ├── athena_setup.yaml    # Athena环境设置
+│   │   └── README.md
+│   └── 06-account-auto-management/
+│       ├── account_auto_move.yaml # 账户自动移动
 │       └── README.md
 ├── scripts/                     # 部署脚本
 │   ├── deploy.sh               # 完整部署
@@ -166,7 +198,8 @@ aws-payer-automation/
 - **Module 3**: ~10分钟
 - **Module 4**: ~10分钟
 - **Module 5**: ~15分钟（Athena设置和初始爬取）
-- **总计**: ~75分钟
+- **Module 6**: ~5分钟（账户自动移动设置）
+- **总计**: ~80分钟
 
 ## 重要说明
 
@@ -208,6 +241,17 @@ aws cloudformation describe-stacks \
   --stack-name payer-athena-setup-* \
   --query 'Stacks[0].Outputs[?OutputKey==`DatabaseName`].OutputValue' \
   --output text
+
+# 获取Normal OU ID
+aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text
+
+# 检查账户自动移动状态
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/AccountAutoMover \
+  --start-time $(date -d '1 hour ago' +%s)000
 
 # 查询Pro forma CUR数据示例
 aws athena start-query-execution \

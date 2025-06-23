@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Automatically move new AWS accounts to Normal OU when they join the organization"
+
+Parameters:
+  NormalOUId:
+    Type: String
+    Description: "ID of the Normal OU where accounts should be moved"
+
+Resources:
+  # S3 Bucket for CloudTrail logs
+  CloudTrailS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "bip-cloudtrail-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    DependsOn:
+      - CloudTrailS3Bucket
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailS3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AWSCloudTrailAclCheck"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com'
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub arn:aws:s3:::${CloudTrailS3Bucket}
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: "AWSCloudTrailWrite"
+            Effect: Allow
+            Principal:
+              Service: 'cloudtrail.amazonaws.com'
+            Action: "s3:PutObject"
+            Resource: !Sub arn:aws:s3:::${CloudTrailS3Bucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # CloudTrail for Organizations events
+  OrganizationsCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: bip-organizations-management-trail
+      S3BucketName: !Ref CloudTrailS3Bucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+
+  # EventBridge Rule for CreateAccountResult events
+  CreateAccountResultRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture CreateAccountResult events and move accounts to Normal OU
+      EventPattern:
+        detail:
+          eventSource:
+            - organizations.amazonaws.com
+          eventName:
+            - CreateAccountResult
+          serviceEventDetails:
+            createAccountStatus:
+              state:
+                - SUCCEEDED
+      State: ENABLED
+      Targets:
+        - Id: SendToAccountMoverLambda
+          Arn: !GetAtt AccountMoverFunction.Arn
+
+  # EventBridge Rule for AcceptHandshake events  
+  AcceptHandshakeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture AcceptHandshake events and move accounts to Normal OU
+      EventPattern:
+        detail:
+          eventSource:
+            - organizations.amazonaws.com
+          eventName:
+            - AcceptHandshake
+          responseElements:
+            handshake:
+              state:
+                - ACCEPTED
+      State: ENABLED
+      Targets:
+        - Id: SendToAccountMoverLambda
+          Arn: !GetAtt AccountMoverFunction.Arn
+
+  # IAM Role for Lambda
+  AccountMoverLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AccountMoverLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAccountMoverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:MoveAccount
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccountsForParent
+                  - organizations:DescribeAccount
+                  - organizations:DescribeOrganizationalUnit
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function for moving accounts
+  AccountMoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AccountAutoMover
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt AccountMoverLambdaRole.Arn
+      Environment:
+        Variables:
+          NORMAL_OU_ID: !Ref NormalOUId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Get the detail from the event
+                  event_detail = event.get("detail", {})
+                  event_name = event_detail.get("eventName")
+                  
+                  organizations = boto3.client('organizations')
+                  normal_ou_id = os.environ['NORMAL_OU_ID']
+                  
+                  print(f"Target Normal OU ID: {normal_ou_id}")
+                  
+                  account_id = None
+                  parent_account_id = event_detail.get("userIdentity", {}).get("accountId")
+                  
+                  # Extract account ID based on event type
+                  if event_name == "CreateAccountResult":
+                      service_event_details = event_detail.get("serviceEventDetails", {})
+                      create_account_status = service_event_details.get("createAccountStatus", {})
+                      account_id = create_account_status.get("accountId")
+                      account_name = create_account_status.get("accountName", "Unknown")
+                      print(f"CreateAccountResult event - New account: {account_name} ({account_id})")
+                      
+                  elif event_name == "AcceptHandshake":
+                      # For AcceptHandshake, the account joining is in userIdentity
+                      account_id = parent_account_id
+                      print(f"AcceptHandshake event - Account joining: {account_id}")
+                  
+                  if not account_id:
+                      print("❌ Could not extract account ID from event")
+                      return {"status": "error", "message": "Could not extract account ID"}
+                  
+                  # Get Root ID to check current parent
+                  roots = organizations.list_roots()
+                  root_id = roots['Roots'][0]['Id']
+                  print(f"Organization Root ID: {root_id}")
+                  
+                  # Check current parent of the account
+                  try:
+                      accounts_in_root = organizations.list_accounts_for_parent(ParentId=root_id)
+                      account_in_root = any(acc['Id'] == account_id for acc in accounts_in_root['Accounts'])
+                      
+                      if account_in_root:
+                          current_parent = root_id
+                          print(f"Account {account_id} is currently in Root")
+                      else:
+                          # Check if already in Normal OU
+                          try:
+                              accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
+                              account_in_normal = any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts'])
+                              
+                              if account_in_normal:
+                                  print(f"✅ Account {account_id} is already in Normal OU")
+                                  return {"status": "success", "message": f"Account {account_id} already in Normal OU"}
+                              else:
+                                  print(f"⚠️ Account {account_id} not found in Root or Normal OU")
+                                  return {"status": "warning", "message": f"Account {account_id} location unknown"}
+                          except Exception as normal_check_error:
+                              print(f"Error checking Normal OU: {str(normal_check_error)}")
+                              current_parent = root_id  # Assume it's in root
+                              
+                  except Exception as parent_check_error:
+                      print(f"Error checking current parent: {str(parent_check_error)}")
+                      current_parent = root_id  # Default to root
+                  
+                  # Move account to Normal OU
+                  try:
+                      print(f"Moving account {account_id} from {current_parent} to Normal OU {normal_ou_id}")
+                      
+                      organizations.move_account(
+                          AccountId=account_id,
+                          SourceParentId=current_parent,
+                          DestinationParentId=normal_ou_id
+                      )
+                      
+                      print(f"✅ Successfully moved account {account_id} to Normal OU")
+                      
+                      # Verify the move
+                      try:
+                          accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
+                          moved_successfully = any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts'])
+                          
+                          if moved_successfully:
+                              print(f"✅ Verified: Account {account_id} is now in Normal OU")
+                              return {"status": "success", "message": f"Account {account_id} moved to Normal OU successfully"}
+                          else:
+                              print(f"⚠️ Move command succeeded but verification failed for account {account_id}")
+                              return {"status": "warning", "message": f"Move succeeded but verification failed"}
+                              
+                      except Exception as verify_error:
+                          print(f"⚠️ Could not verify move: {str(verify_error)}")
+                          return {"status": "warning", "message": f"Move succeeded but could not verify"}
+                          
+                  except Exception as move_error:
+                      error_msg = str(move_error)
+                      print(f"❌ Failed to move account {account_id}: {error_msg}")
+                      
+                      if "InvalidParameterException" in error_msg:
+                          print("❌ Invalid parameter - check if Normal OU ID is correct")
+                      elif "AccessDeniedException" in error_msg:
+                          print("❌ Access denied - check IAM permissions")
+                      elif "AccountNotFoundException" in error_msg:
+                          print("❌ Account not found in organization")
+                      
+                      return {"status": "error", "message": f"Failed to move account: {error_msg}"}
+              
+              except Exception as e:
+                  error_msg = str(e)
+                  print(f"❌ Unexpected error: {error_msg}")
+                  return {"status": "error", "message": f"Unexpected error: {error_msg}"}
+
+  # Lambda permissions for EventBridge
+  LambdaPermissionForCreateAccountRule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AccountMoverFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CreateAccountResultRule.Arn
+
+  LambdaPermissionForAcceptHandshakeRule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AccountMoverFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AcceptHandshakeRule.Arn
+
+Outputs:
+  CloudTrailBucketName:
+    Description: "S3 bucket name for CloudTrail logs"
+    Value: !Ref CloudTrailS3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailBucket"
+
+  AccountMoverFunctionArn:
+    Description: "ARN of the account mover Lambda function"
+    Value: !GetAtt AccountMoverFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountMoverArn"
+
+  NormalOUId:
+    Description: "ID of the Normal OU where accounts are moved"
+    Value: !Ref NormalOUId
+    Export:
+      Name: !Sub "${AWS::StackName}-NormalOUId"
