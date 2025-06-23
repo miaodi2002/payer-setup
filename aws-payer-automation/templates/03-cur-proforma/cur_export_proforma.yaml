@@ -123,7 +123,7 @@ Resources:
                   s3.create_bucket(Bucket=bucket_name)
                   
                   # 设置公共访问阻止
-                  s3.put_bucket_public_access_block(
+                  s3.put_public_access_block(
                       Bucket=bucket_name,
                       PublicAccessBlockConfiguration={
                           'BlockPublicAcls': True,
