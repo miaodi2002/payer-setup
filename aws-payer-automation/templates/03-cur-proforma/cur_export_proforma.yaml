@@ -194,7 +194,7 @@ Resources:
                   raise
 
           def create_cur_export(cur, report_name, bucket_name, billing_group_arn):
-              """创建Legacy CUR Export"""
+              """创建Legacy CUR Export with Pro forma pricing"""
               try:
                   # 检查报告是否已存在
                   try:
@@ -206,33 +206,64 @@ Resources:
                   except:
                       pass
 
-                  # 如果有 BillingGroup ARN，需要转换为 BillingView ARN 或者不使用
-                  print(f"BillingGroup ARN provided: {billing_group_arn}")
+                  print(f"Creating Legacy CUR with Pro forma pricing using BillingGroup: {billing_group_arn}")
                   
-                  # CUR 的 BillingViewArn 格式与 BillingConductor BillingGroup ARN 不兼容
-                  # 我们需要创建不带 BillingViewArn 的 CUR，然后通过其他方式关联
-                  print("Creating CUR without BillingViewArn due to format incompatibility")
+                  # 从BillingGroup ARN中提取名称 (例如: "Bills")
+                  billing_group_name = billing_group_arn.split('/')[-1] if '/' in billing_group_arn else billing_group_arn
+                  print(f"Extracted BillingGroup name: {billing_group_name}")
                   
-                  response = cur.put_report_definition(
-                      ReportDefinition={
-                          'ReportName': report_name,
-                          'TimeUnit': 'DAILY',
-                          'Format': 'Parquet',
-                          'Compression': 'Parquet',
-                          'AdditionalSchemaElements': ['RESOURCES'],
-                          'S3Bucket': bucket_name,
-                          'S3Prefix': 'daily',
-                          'S3Region': 'us-east-1',
-                          'AdditionalArtifacts': ['ATHENA'],
-                          'RefreshClosedReports': True,
-                          'ReportVersioning': 'OVERWRITE_REPORT'
-                          # 注意：不使用 BillingViewArn，因为格式不兼容
-                          # Pro forma 数据将通过 BillingConductor 单独处理
-                      }
-                  )
+                  # 尝试不同的 BillingGroup 参数名称和格式
+                  billing_group_attempts = [
+                      # 尝试1: 使用BillingViewArn with name only
+                      {'BillingViewArn': billing_group_name},
+                      # 尝试2: 使用完整ARN
+                      {'BillingViewArn': billing_group_arn},
+                      # 尝试3: 尝试构造正确的billing view ARN格式
+                      {'BillingViewArn': f"arn:aws:billing::{billing_group_arn.split(':')[4]}:billingview/{billing_group_name}"},
+                      # 尝试4: 仅使用名称，希望AWS会自动解析
+                      {'BillingViewArn': billing_group_name}
+                  ]
                   
-                  print(f"CUR created without BillingViewArn. BillingGroup {billing_group_arn} will be processed separately.")
-                  return f"arn:aws:cur:us-east-1::report/{report_name}"
+                  base_report_definition = {
+                      'ReportName': report_name,
+                      'TimeUnit': 'DAILY',
+                      'Format': 'Parquet',
+                      'Compression': 'Parquet',
+                      'AdditionalSchemaElements': ['RESOURCES'],
+                      'S3Bucket': bucket_name,
+                      'S3Prefix': 'daily',
+                      'S3Region': 'us-east-1',
+                      'AdditionalArtifacts': ['ATHENA'],
+                      'RefreshClosedReports': True,
+                      'ReportVersioning': 'OVERWRITE_REPORT'
+                  }
+                  
+                  last_error = None
+                  
+                  # 尝试不同的BillingGroup参数配置
+                  for i, billing_param in enumerate(billing_group_attempts, 1):
+                      try:
+                          print(f"Attempt {i}: Using parameter {billing_param}")
+                          report_definition = {**base_report_definition, **billing_param}
+                          
+                          response = cur.put_report_definition(ReportDefinition=report_definition)
+                          print(f"✅ Successfully created Legacy CUR with Pro forma pricing using {billing_param}")
+                          return f"arn:aws:cur:us-east-1::report/{report_name}"
+                          
+                      except Exception as e:
+                          last_error = str(e)
+                          print(f"❌ Attempt {i} failed: {last_error}")
+                          continue
+                  
+                  # 如果所有尝试都失败，创建不带BillingGroup的标准CUR
+                  print("All BillingGroup attempts failed, creating standard CUR without Pro forma pricing")
+                  try:
+                      response = cur.put_report_definition(ReportDefinition=base_report_definition)
+                      print(f"⚠️ Created standard CUR without Pro forma pricing. BillingGroup: {billing_group_arn}")
+                      return f"arn:aws:cur:us-east-1::report/{report_name}"
+                  except Exception as standard_error:
+                      print(f"Even standard CUR creation failed: {str(standard_error)}")
+                      raise Exception(f"Failed to create CUR. Last BillingGroup error: {last_error}, Standard CUR error: {str(standard_error)}")
                   
               except Exception as e:
                   print(f"CUR creation error: {str(e)}")
