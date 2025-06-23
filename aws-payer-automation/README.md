@@ -85,12 +85,69 @@
    - CloudFormation完整权限
    - BillingConductor权限
    - Glue和Athena权限
+   - EventBridge权限（Module 6需要）
+   - CloudTrail权限（Module 6需要）
 
 3. **启用服务**
    - AWS Organizations
    - SCP功能
    - BillingConductor（如需要）
    - AWS Glue（自动启用）
+
+### IAM用户权限策略
+
+部署用户需要以下IAM策略权限：
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "organizations:*",
+                "billingconductor:*",
+                "cur:*",
+                "s3:*",
+                "lambda:*",
+                "glue:*",
+                "cloudformation:*",
+                "logs:*",
+                "kms:*",
+                "cloudtrail:*",
+                "events:*",
+                "athena:*"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:GetRole",
+                "iam:UpdateRole",
+                "iam:PutRolePolicy",
+                "iam:DeleteRolePolicy",
+                "iam:GetRolePolicy",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:ListRolePolicies",
+                "iam:ListAttachedRolePolicies",
+                "iam:PassRole",
+                "iam:TagRole",
+                "iam:UntagRole",
+                "iam:ListRoles"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+**新增权限说明**：
+- `events:*`: Module 6需要创建和管理EventBridge规则
+- `athena:*`: Module 5需要创建Athena工作组和查询权限
 
 ### 一键部署
 
@@ -282,6 +339,16 @@ aws athena start-query-execution \
 4. **账户创建超时**
    - 等待最多30分钟
    - 检查AWS服务状态
+
+5. **EventBridge权限错误**
+   - 错误信息：`is not authorized to perform: events:DescribeRule`
+   - 解决方案：为setup_user添加`events:*`权限
+   - 参考上面的完整IAM策略
+
+6. **Module 6部署失败**
+   - 确认CloudTrail S3存储桶策略正确
+   - 检查EventBridge规则创建权限
+   - 验证Lambda函数权限
 
 ### 日志查看
 
