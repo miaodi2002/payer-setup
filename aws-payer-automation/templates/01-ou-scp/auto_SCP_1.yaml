@@ -275,9 +275,13 @@ Resources:
                 Action:
                   - organizations:AttachPolicy
                   - organizations:EnablePolicyType
+                  - organizations:DisablePolicyType
                   - organizations:DescribeOrganization
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:DescribePolicy
                   - organizations:ListRoots
                   - organizations:ListPolicies
+                  - organizations:ListPoliciesForTarget
                 Resource: "*"
 
   # Lambda Function (Python)
@@ -427,23 +431,141 @@ Resources:
                   raise
 
           def attach_policy_with_retry(organizations, policy_id, target_id, max_retries=5):
-              """Attach policy with retry mechanism"""
+              """Attach policy with retry mechanism with enhanced troubleshooting"""
+              
+              # First, let's try to understand what's happening by checking the target
+              try:
+                  print(f"Attempting to attach policy {policy_id} to target {target_id}")
+                  
+                  # Check if the target is the root or an OU
+                  if target_id.startswith('r-'):
+                      print(f"Target {target_id} is a ROOT")
+                      # Verify root exists
+                      roots = organizations.list_roots()
+                      root_ids = [root['Id'] for root in roots['Roots']]
+                      if target_id not in root_ids:
+                          raise Exception(f"Root {target_id} not found in organization")
+                  elif target_id.startswith('ou-'):
+                      print(f"Target {target_id} is an OU")
+                      # Try to get OU details
+                      try:
+                          ou_details = organizations.describe_organizational_unit(OrganizationalUnitId=target_id)
+                          print(f"OU details: {ou_details}")
+                      except Exception as ou_error:
+                          print(f"Warning: Could not get OU details: {str(ou_error)}")
+                  
+                  # Check policy details
+                  try:
+                      policy_details = organizations.describe_policy(PolicyId=policy_id)
+                      print(f"Policy type: {policy_details['Policy']['Type']}")
+                      print(f"Policy name: {policy_details['Policy']['Name']}")
+                  except Exception as policy_error:
+                      print(f"Warning: Could not get policy details: {str(policy_error)}")
+                  
+                  # Check if policy is already attached
+                  try:
+                      policies_for_target = organizations.list_policies_for_target(
+                          TargetId=target_id,
+                          Filter='SERVICE_CONTROL_POLICY'
+                      )
+                      attached_policy_ids = [p['Id'] for p in policies_for_target['Policies']]
+                      if policy_id in attached_policy_ids:
+                          print(f"Policy {policy_id} is already attached to {target_id}")
+                          return
+                      else:
+                          print(f"Policy {policy_id} not yet attached. Currently attached: {attached_policy_ids}")
+                  except Exception as list_error:
+                      print(f"Could not list policies for target: {str(list_error)}")
+                  
+              except Exception as diagnostic_error:
+                  print(f"Error in diagnostic phase: {str(diagnostic_error)}")
+              
+              # Now try to attach with retries
               for attempt in range(max_retries):
                   try:
+                      print(f"Attach attempt {attempt + 1}/{max_retries}")
+                      
+                      # Try a different approach: re-verify SCP is enabled before each attempt
+                      if attempt > 0:
+                          org_info = organizations.describe_organization()
+                          available_types = org_info['Organization']['AvailablePolicyTypes']
+                          scp_status = next((pt['Status'] for pt in available_types if pt['Type'] == 'SERVICE_CONTROL_POLICY'), 'NOT_FOUND')
+                          print(f"Pre-attach verification - SCP status: {scp_status}")
+                          
+                          # Try to list policies again to ensure we still have access
+                          try:
+                              policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                              print(f"Pre-attach verification - can list {len(policies.get('Policies', []))} policies")
+                          except Exception as list_error:
+                              print(f"Pre-attach verification failed: {str(list_error)}")
+                              if "PolicyTypeNotEnabledException" in str(list_error):
+                                  print("SCP status inconsistent - attempting re-enable")
+                                  ensure_scp_enabled(organizations)
+                      
+                      # Actual attach attempt
                       organizations.attach_policy(PolicyId=policy_id, TargetId=target_id)
-                      print(f"Successfully attached policy {policy_id} to {target_id}")
+                      print(f"✅ Successfully attached policy {policy_id} to {target_id}")
                       return
+                      
                   except Exception as e:
-                      if "PolicyTypeNotEnabledException" in str(e) and attempt < max_retries - 1:
-                          print(f"Policy type not enabled on attempt {attempt + 1}, waiting longer...")
-                          # Wait longer for SCP to propagate
-                          wait_time = 15 + (attempt * 5)  # Progressive backoff: 15s, 20s, 25s, 30s
-                          print(f"Waiting {wait_time} seconds for SCP to propagate...")
-                          time.sleep(wait_time)
-                          continue
+                      error_msg = str(e)
+                      print(f"Attach attempt {attempt + 1} failed: {error_msg}")
+                      
+                      if "PolicyTypeNotEnabledException" in error_msg:
+                          if attempt < max_retries - 1:
+                              # For this specific error, try some additional debugging
+                              print("PolicyTypeNotEnabledException detected - investigating...")
+                              
+                              # Check if this is a region-specific issue
+                              try:
+                                  session = boto3.Session()
+                                  current_region = session.region_name
+                                  print(f"Current region: {current_region}")
+                              except:
+                                  print("Could not determine current region")
+                              
+                              # Try to force re-enable SCP
+                              print("Attempting to force re-enable SCP...")
+                              try:
+                                  roots = organizations.list_roots()
+                                  root_id = roots['Roots'][0]['Id']
+                                  
+                                  # Try to disable and re-enable (this might fail, but let's try)
+                                  try:
+                                      organizations.disable_policy_type(
+                                          RootId=root_id,
+                                          PolicyType='SERVICE_CONTROL_POLICY'
+                                      )
+                                      print("Disabled SCP policy type")
+                                      time.sleep(10)
+                                  except Exception as disable_error:
+                                      print(f"Could not disable SCP (expected): {str(disable_error)}")
+                                  
+                                  # Re-enable
+                                  organizations.enable_policy_type(
+                                      RootId=root_id,
+                                      PolicyType='SERVICE_CONTROL_POLICY'
+                                  )
+                                  print("Re-enabled SCP policy type")
+                                  
+                              except Exception as force_error:
+                                  print(f"Force re-enable failed: {str(force_error)}")
+                              
+                              wait_time = 30 + (attempt * 15)  # 30s, 45s, 60s, 75s
+                              print(f"Waiting {wait_time} seconds before retry...")
+                              time.sleep(wait_time)
+                              continue
+                          else:
+                              # Final attempt failed
+                              print("❌ All attempts failed with PolicyTypeNotEnabledException")
+                              print("This appears to be an AWS internal issue or account limitation")
+                              raise Exception(f"Failed to attach policy after {max_retries} attempts. AWS may have internal inconsistency between SCP status and attachment capability. Error: {error_msg}")
                       else:
-                          print(f"Error attaching policy {policy_id} to {target_id} after {attempt + 1} attempts: {str(e)}")
-                          raise
+                          # Different error
+                          if attempt == max_retries - 1:
+                              raise Exception(f"Failed to attach policy {policy_id} to {target_id} after {max_retries} attempts: {error_msg}")
+                          time.sleep(10)
+                          continue
 
   # Custom Resource 觸發 Lambda
   InvokeLambda:
