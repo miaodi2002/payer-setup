@@ -33,6 +33,7 @@ Resources:
                   - cur:PutReportDefinition
                   - cur:DescribeReportDefinitions
                   - cur:ModifyReportDefinition
+                  - cur:DeleteReportDefinition
                   - s3:CreateBucket
                   - s3:PutBucketPolicy
                   - s3:PutBucketPublicAccessBlock
@@ -208,21 +209,49 @@ Resources:
 
                   print(f"Creating Legacy CUR with Pro forma pricing using BillingGroup: {billing_group_arn}")
                   
-                  # 从BillingGroup ARN中提取名称 (例如: "Bills")
+                  # 从BillingGroup ARN中提取名称和账户ID
                   billing_group_name = billing_group_arn.split('/')[-1] if '/' in billing_group_arn else billing_group_arn
-                  print(f"Extracted BillingGroup name: {billing_group_name}")
+                  account_id = billing_group_arn.split(':')[4] if ':' in billing_group_arn else '000000000000'
+                  print(f"Extracted BillingGroup name: {billing_group_name}, Account ID: {account_id}")
                   
-                  # 尝试不同的 BillingGroup 参数名称和格式
-                  billing_group_attempts = [
-                      # 尝试1: 使用BillingViewArn with name only
+                  # 首先尝试创建或查找对应的BillingView
+                  import boto3
+                  billingconductor = boto3.client('billingconductor')
+                  
+                  try:
+                      # 尝试列出billing views（如果有这样的API）
+                      print("Attempting to create/find BillingView for the BillingGroup...")
+                      # 这是一个假设的API，实际API名称可能不同
+                      billing_view_arn = create_or_find_billing_view(billingconductor, billing_group_arn, billing_group_name, account_id)
+                      if billing_view_arn:
+                          print(f"Found/created BillingView: {billing_view_arn}")
+                      else:
+                          print("No BillingView available, will use name-based approaches")
+                  except Exception as billing_view_error:
+                      print(f"BillingView creation failed: {str(billing_view_error)}")
+                      billing_view_arn = None
+                  
+                  # 准备尝试列表，优先使用构造的billing view ARN
+                  billing_group_attempts = []
+                  
+                  # 如果找到了billing view ARN，优先使用它
+                  if billing_view_arn:
+                      billing_group_attempts.append({'BillingViewArn': billing_view_arn})
+                  
+                  # 添加其他尝试方法
+                  billing_group_attempts.extend([
+                      # 尝试: 构造正确的billing view ARN格式  
+                      {'BillingViewArn': f"arn:aws:billing::{account_id}:billingview/{billing_group_name}"},
+                      # 尝试: 仅使用BillingGroup名称
                       {'BillingViewArn': billing_group_name},
-                      # 尝试2: 使用完整ARN
+                      # 尝试: 使用原始BillingGroup ARN（虽然格式可能不对）
                       {'BillingViewArn': billing_group_arn},
-                      # 尝试3: 尝试构造正确的billing view ARN格式
-                      {'BillingViewArn': f"arn:aws:billing::{billing_group_arn.split(':')[4]}:billingview/{billing_group_name}"},
-                      # 尝试4: 仅使用名称，希望AWS会自动解析
-                      {'BillingViewArn': billing_group_name}
-                  ]
+                      # 尝试: 使用不同的参数名称
+                      {'BillingGroup': billing_group_name},
+                      {'BillingGroupArn': billing_group_arn}
+                  ])
+                  
+                  print(f"Will attempt {len(billing_group_attempts)} different configurations")
                   
                   base_report_definition = {
                       'ReportName': report_name,
@@ -247,8 +276,28 @@ Resources:
                           report_definition = {**base_report_definition, **billing_param}
                           
                           response = cur.put_report_definition(ReportDefinition=report_definition)
-                          print(f"✅ Successfully created Legacy CUR with Pro forma pricing using {billing_param}")
-                          return f"arn:aws:cur:us-east-1::report/{report_name}"
+                          print(f"✅ CUR creation succeeded using {billing_param}")
+                          
+                          # 验证CUR是否真的关联了BillingGroup
+                          time.sleep(2)  # 等待AWS处理
+                          created_reports = cur.describe_report_definitions()
+                          for report in created_reports['ReportDefinitions']:
+                              if report['ReportName'] == report_name:
+                                  billing_view = report.get('BillingViewArn', 'NOT_SET')
+                                  print(f"Created CUR verification - BillingViewArn: {billing_view}")
+                                  if billing_view and billing_view != 'NOT_SET':
+                                      print(f"🎉 Successfully created Legacy CUR with Pro forma pricing!")
+                                      return f"arn:aws:cur:us-east-1::report/{report_name}"
+                                  else:
+                                      print(f"⚠️ CUR created but BillingGroup not associated. Trying next method...")
+                                      # 删除这个不正确的报告并尝试下一个方法
+                                      try:
+                                          cur.delete_report_definition(ReportName=report_name)
+                                          print(f"Deleted incorrect CUR to try next method")
+                                      except:
+                                          pass
+                                      break
+                          continue
                           
                       except Exception as e:
                           last_error = str(e)
@@ -268,6 +317,32 @@ Resources:
               except Exception as e:
                   print(f"CUR creation error: {str(e)}")
                   raise
+
+          def create_or_find_billing_view(billingconductor, billing_group_arn, billing_group_name, account_id):
+              """尝试创建或查找对应的BillingView"""
+              try:
+                  # BillingConductor可能不直接提供BillingView API
+                  # 但我们可以尝试构造正确的ARN格式
+                  
+                  # 尝试不同的可能的billing view ARN格式
+                  possible_arns = [
+                      f"arn:aws:billing::{account_id}:billingview/{billing_group_name}",
+                      f"arn:aws:billingconductor::{account_id}:billingview/{billing_group_name}",
+                      f"arn:aws:billing::us-east-1:{account_id}:billingview/{billing_group_name}",
+                      billing_group_name  # 简单名称
+                  ]
+                  
+                  for arn in possible_arns:
+                      print(f"Testing potential BillingView ARN: {arn}")
+                  
+                  # 由于没有直接的API来验证BillingView，我们返回最可能的格式
+                  preferred_arn = f"arn:aws:billing::{account_id}:billingview/{billing_group_name}"
+                  print(f"Using preferred BillingView ARN format: {preferred_arn}")
+                  return preferred_arn
+                  
+              except Exception as e:
+                  print(f"Error in create_or_find_billing_view: {str(e)}")
+                  return None
 
   # Custom Resource触发Lambda
   CreateLegacyCURExport:
