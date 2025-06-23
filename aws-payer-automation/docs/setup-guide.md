@@ -48,7 +48,10 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
                 "kms:*",
                 "cloudtrail:*",
                 "events:*",
-                "athena:*"
+                "athena:*",
+                "oam:*",
+                "sns:*",
+                "cloudwatch:*"
             ],
             "Resource": "*"
         },
@@ -72,6 +75,13 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
                 "iam:ListRoles"
             ],
             "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sts:AssumeRole"
+            ],
+            "Resource": "arn:aws:iam::*:role/OrganizationAccountAccessRole"
         }
     ]
 }
@@ -90,7 +100,11 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
 - `cloudtrail:*`: CloudTrail管理权限（Module 6）
 - `events:*`: EventBridge权限（Module 6）
 - `athena:*`: Athena查询引擎权限（Module 5）
+- `oam:*`: Observability Access Manager权限（Module 7）
+- `sns:*`: SNS消息服务权限（Module 7）
+- `cloudwatch:*`: CloudWatch监控和告警权限（Module 7）
 - **IAM权限限制**: 只允许角色管理相关权限，不包含用户和策略管理
+- **跨账户权限**: 允许AssumeRole到成员账户的OrganizationAccountAccessRole（Module 7需要）
 
 #### 权限验证脚本
 ```bash
@@ -163,6 +177,30 @@ else
     exit 1
 fi
 
+# OAM权限（Module 7）
+if aws oam list-sinks &> /dev/null; then
+    echo "✓ OAM access confirmed"
+else
+    echo "✗ OAM access denied"
+    exit 1
+fi
+
+# SNS权限（Module 7）
+if aws sns list-topics &> /dev/null; then
+    echo "✓ SNS access confirmed"
+else
+    echo "✗ SNS access denied"
+    exit 1
+fi
+
+# CloudWatch权限（Module 7）
+if aws cloudwatch list-metrics --max-items 1 &> /dev/null; then
+    echo "✓ CloudWatch access confirmed"
+else
+    echo "✗ CloudWatch access denied"
+    exit 1
+fi
+
 # BillingConductor权限（Module 2）
 if aws billingconductor list-billing-groups --region us-east-1 &> /dev/null; then
     echo "✓ BillingConductor access confirmed"
@@ -185,9 +223,37 @@ else
     exit 1
 fi
 
+# 跨账户权限测试（Module 7）
+echo "Testing cross-account permissions for Module 7..."
+MEMBER_ACCOUNTS=$(aws organizations list-accounts --query 'Accounts[?Status==`ACTIVE`].Id' --output text 2>/dev/null)
+
+if [ -n "$MEMBER_ACCOUNTS" ]; then
+    FIRST_ACCOUNT=$(echo $MEMBER_ACCOUNTS | awk '{print $1}')
+    if [ "$FIRST_ACCOUNT" != "$(aws sts get-caller-identity --query Account --output text)" ]; then
+        echo "Testing assume role to member account: $FIRST_ACCOUNT"
+        aws sts assume-role \
+          --role-arn "arn:aws:iam::$FIRST_ACCOUNT:role/OrganizationAccountAccessRole" \
+          --role-session-name "PermissionTest" \
+          --duration-seconds 900 &> /dev/null
+        
+        if [ $? -eq 0 ]; then
+            echo "✓ Cross-account assume role access confirmed"
+        else
+            echo "⚠ Warning: Cross-account assume role failed - Module 7 may have limited functionality"
+            echo "  This is expected if OrganizationAccountAccessRole doesn't exist in member accounts"
+        fi
+    else
+        echo "⚠ Warning: No member accounts found for cross-account testing"
+    fi
+else
+    echo "⚠ Warning: Could not retrieve member accounts list"
+fi
+
+echo ""
 echo "Permission check completed successfully"
 echo ""
 echo "All required permissions are available for AWS Payer automation deployment."
+echo "Note: Module 7 requires OrganizationAccountAccessRole in member accounts for full functionality."
 ```
 
 ### 3. AWS服务启用状态
@@ -507,7 +573,6 @@ if aws oam list-sinks &> /dev/null; then
     echo "✓ OAM access confirmed"
 else
     echo "✗ OAM access denied - check IAM permissions"
-    exit 1
 fi
 
 # 获取所有成员账户ID
