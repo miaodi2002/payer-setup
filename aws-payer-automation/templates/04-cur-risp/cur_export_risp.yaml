@@ -102,40 +102,71 @@ Resources:
                   cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
 
           def create_s3_bucket(s3, bucket_name):
-              """创建S3 Bucket"""
+              """创建或配置S3 Bucket"""
               try:
+                  bucket_exists = False
+                  
                   # 检查bucket是否已存在
                   try:
-                      s3.head_bucket(Bucket=bucket_name)
-                      print(f"Bucket {bucket_name} already exists")
-                      return 'us-east-1'
-                  except:
-                      pass
+                      response = s3.head_bucket(Bucket=bucket_name)
+                      print(f"✅ Bucket {bucket_name} already exists")
+                      bucket_exists = True
+                  except Exception as head_error:
+                      print(f"Bucket {bucket_name} does not exist, will create: {str(head_error)}")
 
-                  # 创建bucket（在us-east-1）
-                  s3.create_bucket(Bucket=bucket_name)
+                  # 如果bucket不存在，创建它
+                  if not bucket_exists:
+                      try:
+                          print(f"Creating bucket {bucket_name} in us-east-1...")
+                          s3.create_bucket(Bucket=bucket_name)
+                          print(f"✅ Successfully created bucket {bucket_name}")
+                      except Exception as create_error:
+                          error_msg = str(create_error)
+                          if "BucketAlreadyExists" in error_msg or "BucketAlreadyOwnedByYou" in error_msg:
+                              print(f"✅ Bucket {bucket_name} already exists (detected during creation)")
+                              bucket_exists = True
+                          else:
+                              print(f"❌ Failed to create bucket: {error_msg}")
+                              raise
+
+                  # 无论bucket是新创建的还是已存在的，都确保正确配置
+                  print(f"Configuring bucket {bucket_name} settings...")
                   
                   # 设置公共访问阻止
-                  s3.put_public_access_block(
-                      Bucket=bucket_name,
-                      PublicAccessBlockConfiguration={
-                          'BlockPublicAcls': True,
-                          'IgnorePublicAcls': True,
-                          'BlockPublicPolicy': True,
-                          'RestrictPublicBuckets': True
-                      }
-                  )
+                  try:
+                      s3.put_public_access_block(
+                          Bucket=bucket_name,
+                          PublicAccessBlockConfiguration={
+                              'BlockPublicAcls': True,
+                              'IgnorePublicAcls': True,
+                              'BlockPublicPolicy': True,
+                              'RestrictPublicBuckets': True
+                          }
+                      )
+                      print(f"✅ Public access block configured for {bucket_name}")
+                  except Exception as pab_error:
+                      print(f"⚠️ Public access block configuration failed: {str(pab_error)}")
+                      # 不抛出异常，因为这不是关键失败
                   
                   # 启用版本控制
-                  s3.put_bucket_versioning(
-                      Bucket=bucket_name,
-                      VersioningConfiguration={'Status': 'Enabled'}
-                  )
+                  try:
+                      s3.put_bucket_versioning(
+                          Bucket=bucket_name,
+                          VersioningConfiguration={'Status': 'Enabled'}
+                      )
+                      print(f"✅ Versioning enabled for {bucket_name}")
+                  except Exception as version_error:
+                      print(f"⚠️ Versioning configuration failed: {str(version_error)}")
+                      # 不抛出异常，因为这不是关键失败
                   
                   return 'us-east-1'
                   
               except Exception as e:
-                  print(f"S3 bucket creation error: {str(e)}")
+                  print(f"❌ S3 bucket creation/configuration error: {str(e)}")
+                  # 如果是配置错误但bucket存在，不抛出异常
+                  if "NoSuchBucket" not in str(e):
+                      print(f"⚠️ Bucket may exist but configuration failed, continuing...")
+                      return 'us-east-1'
                   raise
 
           def set_s3_bucket_policy(s3, bucket_name, account_id):
