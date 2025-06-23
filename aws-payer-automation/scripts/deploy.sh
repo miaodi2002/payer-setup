@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # AWS Payer Automation - Complete Deployment Script
-# This script deploys all 5 modules in the correct order with dependency management
+# This script deploys all 6 modules in the correct order with dependency management
 
 set -e
 
@@ -218,6 +218,33 @@ deploy_module5() {
     print_status "Athena Database: $DATABASE_NAME"
 }
 
+# Function to deploy module 6 (Account Auto Movement)
+deploy_module6() {
+    print_status "Deploying Module 6: Account Auto Movement"
+    
+    local stack_name="${STACK_PREFIX}-account-auto-move-${TIMESTAMP}"
+    
+    # Get Normal OU ID from Module 1
+    NORMAL_OU_ID=$(get_stack_output "$STACK1_NAME" "NormalOUId")
+    
+    print_status "Using parameters:"
+    print_status "  Normal OU ID: $NORMAL_OU_ID"
+    
+    aws cloudformation create-stack \
+        --stack-name "$stack_name" \
+        --template-body file://templates/06-account-auto-management/account_auto_move.yaml \
+        --parameters ParameterKey=NormalOUId,ParameterValue="$NORMAL_OU_ID" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION"
+    
+    wait_for_stack "$stack_name" "create"
+    
+    STACK6_NAME="$stack_name"
+    CLOUDTRAIL_BUCKET=$(get_stack_output "$stack_name" "CloudTrailBucketName")
+    print_success "Module 6 deployed successfully: $stack_name"
+    print_status "CloudTrail Bucket: $CLOUDTRAIL_BUCKET"
+}
+
 # Function to print deployment summary
 print_summary() {
     print_success "=== Deployment Summary ==="
@@ -231,14 +258,18 @@ print_summary() {
     echo "  3. Pro forma CUR: $STACK3_NAME"
     echo "  4. RISP CUR: $STACK4_NAME"
     echo "  5. Athena Setup: $STACK5_NAME"
+    echo "  6. Account Auto Movement: $STACK6_NAME"
     echo ""
     echo "Key Resources:"
     echo "  BillingGroup ARN: $BILLING_GROUP_ARN"
+    echo "  Normal OU ID: $NORMAL_OU_ID"
     echo "  Athena Database: $DATABASE_NAME"
+    echo "  CloudTrail Bucket: $CLOUDTRAIL_BUCKET"
     echo ""
     print_success "All modules deployed successfully!"
     print_warning "Note: CUR reports may take up to 24 hours to generate first data"
     print_warning "Note: Athena crawlers will start automatically but may take 10-15 minutes to complete"
+    print_warning "Note: Account auto-movement is now active - new accounts will be automatically moved to Normal OU"
 }
 
 # Main deployment function
@@ -261,6 +292,7 @@ main() {
     deploy_module3
     deploy_module4
     deploy_module5
+    deploy_module6
     
     print_summary
 }

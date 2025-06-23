@@ -38,19 +38,59 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
             "Effect": "Allow",
             "Action": [
                 "organizations:*",
-                "iam:*",
-                "cloudformation:*",
-                "lambda:*",
-                "s3:*",
-                "cur:*",
                 "billingconductor:*",
-                "logs:*"
+                "cur:*",
+                "s3:*",
+                "lambda:*",
+                "glue:*",
+                "cloudformation:*",
+                "logs:*",
+                "kms:*",
+                "cloudtrail:*",
+                "events:*",
+                "athena:*"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:GetRole",
+                "iam:UpdateRole",
+                "iam:PutRolePolicy",
+                "iam:DeleteRolePolicy",
+                "iam:GetRolePolicy",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:ListRolePolicies",
+                "iam:ListAttachedRolePolicies",
+                "iam:PassRole",
+                "iam:TagRole",
+                "iam:UntagRole",
+                "iam:ListRoles"
             ],
             "Resource": "*"
         }
     ]
 }
 ```
+
+**权限说明**：
+- `organizations:*`: AWS Organizations完整管理权限
+- `billingconductor:*`: BillingConductor服务权限（Module 2）
+- `cur:*`: Cost and Usage Reports权限（Module 3, 4）
+- `s3:*`: S3完整权限（存储桶和CUR数据）
+- `lambda:*`: Lambda函数管理权限
+- `glue:*`: AWS Glue数据目录权限（Module 5）
+- `cloudformation:*`: CloudFormation完整权限
+- `logs:*`: CloudWatch Logs权限
+- `kms:*`: KMS加密权限
+- `cloudtrail:*`: CloudTrail管理权限（Module 6）
+- `events:*`: EventBridge权限（Module 6）
+- `athena:*`: Athena查询引擎权限（Module 5）
+- **IAM权限限制**: 只允许角色管理相关权限，不包含用户和策略管理
 
 #### 权限验证脚本
 ```bash
@@ -75,14 +115,79 @@ else
     exit 1
 fi
 
-# BillingConductor权限（可选）
+# S3权限
+if aws s3 ls &> /dev/null; then
+    echo "✓ S3 access confirmed"
+else
+    echo "✗ S3 access denied"
+    exit 1
+fi
+
+# Lambda权限
+if aws lambda list-functions &> /dev/null; then
+    echo "✓ Lambda access confirmed"
+else
+    echo "✗ Lambda access denied"
+    exit 1
+fi
+
+# CloudTrail权限（Module 6）
+if aws cloudtrail describe-trails &> /dev/null; then
+    echo "✓ CloudTrail access confirmed"
+else
+    echo "✗ CloudTrail access denied"
+    exit 1
+fi
+
+# EventBridge权限（Module 6）
+if aws events list-rules &> /dev/null; then
+    echo "✓ EventBridge access confirmed"
+else
+    echo "✗ EventBridge access denied"
+    exit 1
+fi
+
+# Glue权限（Module 5）
+if aws glue get-databases &> /dev/null; then
+    echo "✓ Glue access confirmed"
+else
+    echo "✗ Glue access denied"
+    exit 1
+fi
+
+# Athena权限（Module 5）
+if aws athena list-work-groups &> /dev/null; then
+    echo "✓ Athena access confirmed"
+else
+    echo "✗ Athena access denied"
+    exit 1
+fi
+
+# BillingConductor权限（Module 2）
 if aws billingconductor list-billing-groups --region us-east-1 &> /dev/null; then
     echo "✓ BillingConductor access confirmed"
 else
     echo "⚠ BillingConductor access limited (may be expected)"
 fi
 
-echo "Permission check completed"
+# CUR权限（Module 3, 4）
+if aws cur describe-report-definitions --region us-east-1 &> /dev/null; then
+    echo "✓ CUR access confirmed"
+else
+    echo "⚠ CUR access limited (may be expected)"
+fi
+
+# IAM权限验证
+if aws iam list-roles --max-items 1 &> /dev/null; then
+    echo "✓ IAM role management access confirmed"
+else
+    echo "✗ IAM role management access denied"
+    exit 1
+fi
+
+echo "Permission check completed successfully"
+echo ""
+echo "All required permissions are available for AWS Payer automation deployment."
 ```
 
 ### 3. AWS服务启用状态
@@ -292,6 +397,107 @@ aws cur describe-report-definitions --region us-east-1 | grep risp
 aws s3 ls | grep bip-risp-cur-
 ```
 
+### Step 5: 部署Athena环境（Module 5）
+
+#### 5.1 获取前置参数
+```bash
+# 获取Module 3和4的输出参数
+PROFORMA_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-proforma-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
+  --output text)
+
+RISP_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-risp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`RISPBucketName`].OutputValue' \
+  --output text)
+
+PROFORMA_REPORT=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-proforma-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`ReportName`].OutputValue' \
+  --output text)
+
+RISP_REPORT=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-risp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`RISPReportName`].OutputValue' \
+  --output text)
+
+echo "Pro forma Bucket: $PROFORMA_BUCKET"
+echo "RISP Bucket: $RISP_BUCKET"
+echo "Pro forma Report: $PROFORMA_REPORT"
+echo "RISP Report: $RISP_REPORT"
+```
+
+#### 5.2 部署执行
+```bash
+# 部署Module 5
+./scripts/deploy-single.sh 5 \
+  --proforma-bucket $PROFORMA_BUCKET \
+  --risp-bucket $RISP_BUCKET \
+  --proforma-report $PROFORMA_REPORT \
+  --risp-report $RISP_REPORT
+```
+
+#### 5.3 验证Athena设置
+```bash
+# 检查Glue数据库
+aws glue get-databases
+
+# 检查Glue爬虫
+aws glue get-crawlers
+
+# 检查Athena工作组
+aws athena list-work-groups
+```
+
+### Step 6: 部署账户自动移动（Module 6）
+
+#### 6.1 获取Normal OU ID
+```bash
+# 获取Module 1创建的Normal OU ID
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+echo "Normal OU ID: $NORMAL_OU_ID"
+
+# 验证OU存在
+aws organizations describe-organizational-unit --organizational-unit-id $NORMAL_OU_ID
+```
+
+#### 6.2 部署执行
+```bash
+# 智能模式部署（推荐 - 自动检测CloudTrail基础设施）
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID
+
+# 或者明确指定模式
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID --cloudtrail-mode auto
+
+# 强制创建新CloudTrail
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID --cloudtrail-mode true
+
+# 跳过CloudTrail创建
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID --cloudtrail-mode false
+```
+
+#### 6.3 验证自动移动设置
+```bash
+# 检查EventBridge规则
+aws events list-rules --name-prefix CreateAccountResult
+aws events list-rules --name-prefix AcceptHandshake
+
+# 检查Lambda函数
+aws lambda get-function --function-name AccountAutoMover
+
+# 检查CloudTrail状态
+aws cloudtrail describe-trails
+aws cloudtrail get-trail-status --name bip-organizations-management-trail
+
+# 验证CloudTrail事件选择器
+aws cloudtrail get-event-selectors --trail-name bip-organizations-management-trail
+```
+
 ## 验证和测试
 
 ### 1. 完整性检查
@@ -321,6 +527,20 @@ aws billingconductor list-billing-groups --region us-east-1
 
 # 验证CUR报告
 aws cur describe-report-definitions --region us-east-1
+
+# 验证Glue数据库和爬虫（Module 5）
+aws glue get-databases
+aws glue get-crawlers
+
+# 验证EventBridge规则（Module 6）
+aws events list-rules --name-prefix CreateAccountResult
+aws events list-rules --name-prefix AcceptHandshake
+
+# 验证Lambda函数（Module 6）
+aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `AccountAutoMover`)].FunctionName'
+
+# 验证CloudTrail（Module 6）
+aws cloudtrail describe-trails
 ```
 
 ### 2. 功能测试

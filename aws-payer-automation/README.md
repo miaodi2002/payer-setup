@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-由于AWS 6月政策变更，不再允许RISP跨客户共享，需要为每个客户创建独立Payer。本项目提供基于CloudFormation + Lambda的模块化自动化方案，包含4个核心模块，实现AWS Reseller Payer账户的完全自动化初始化。
+由于AWS 6月政策变更，不再允许RISP跨客户共享，需要为每个客户创建独立Payer。本项目提供基于CloudFormation + Lambda的模块化自动化方案，包含6个核心模块，实现AWS Reseller Payer账户的完全自动化初始化。
 
 ## 架构图
 
@@ -63,6 +63,12 @@
 - 配置S3事件通知自动触发数据更新
 - 创建状态表跟踪CUR数据生成状态
 
+### Module 6: 账户自动移动
+- 监控AWS Organizations事件（CreateAccountResult、AcceptHandshake）
+- 自动将新加入的账户移动到Normal OU
+- 应用SCP限制防止购买预付费服务
+- CloudTrail日志记录所有账户移动活动
+
 ## 快速开始
 
 ### 前置条件
@@ -79,12 +85,69 @@
    - CloudFormation完整权限
    - BillingConductor权限
    - Glue和Athena权限
+   - EventBridge权限（Module 6需要）
+   - CloudTrail权限（Module 6需要）
 
 3. **启用服务**
    - AWS Organizations
    - SCP功能
    - BillingConductor（如需要）
    - AWS Glue（自动启用）
+
+### IAM用户权限策略
+
+部署用户需要以下IAM策略权限：
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "organizations:*",
+                "billingconductor:*",
+                "cur:*",
+                "s3:*",
+                "lambda:*",
+                "glue:*",
+                "cloudformation:*",
+                "logs:*",
+                "kms:*",
+                "cloudtrail:*",
+                "events:*",
+                "athena:*"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:GetRole",
+                "iam:UpdateRole",
+                "iam:PutRolePolicy",
+                "iam:DeleteRolePolicy",
+                "iam:GetRolePolicy",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:ListRolePolicies",
+                "iam:ListAttachedRolePolicies",
+                "iam:PassRole",
+                "iam:TagRole",
+                "iam:UntagRole",
+                "iam:ListRoles"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+**新增权限说明**：
+- `events:*`: Module 6需要创建和管理EventBridge规则
+- `athena:*`: Module 5需要创建Athena工作组和查询权限
 
 ### 一键部署
 
@@ -123,6 +186,29 @@ BILLING_GROUP_ARN=$(aws cloudformation describe-stacks \
 
 # 部署Module 4
 ./scripts/deploy-single.sh 4
+
+# 获取ProformaBucket等参数并部署Module 5
+PROFORMA_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-proforma-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
+  --output text)
+
+RISP_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name payer-cur-risp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`RISPBucketName`].OutputValue' \
+  --output text)
+
+# 部署Module 5
+./scripts/deploy-single.sh 5 --proforma-bucket $PROFORMA_BUCKET --risp-bucket $RISP_BUCKET --proforma-report $ACCOUNT_ID --risp-report risp-$ACCOUNT_ID
+
+# 获取Normal OU ID并部署Module 6
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+# 部署Module 6
+./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID
 ```
 
 ## 项目结构
@@ -143,8 +229,11 @@ aws-payer-automation/
 │   ├── 04-cur-risp/
 │   │   ├── cur_export_risp.yaml # RISP CUR
 │   │   └── README.md
-│   └── 05-athena-setup/
-│       ├── athena_setup.yaml    # Athena环境设置
+│   ├── 05-athena-setup/
+│   │   ├── athena_setup.yaml    # Athena环境设置
+│   │   └── README.md
+│   └── 06-account-auto-management/
+│       ├── account_auto_move.yaml # 账户自动移动
 │       └── README.md
 ├── scripts/                     # 部署脚本
 │   ├── deploy.sh               # 完整部署
@@ -166,7 +255,8 @@ aws-payer-automation/
 - **Module 3**: ~10分钟
 - **Module 4**: ~10分钟
 - **Module 5**: ~15分钟（Athena设置和初始爬取）
-- **总计**: ~75分钟
+- **Module 6**: ~5分钟（账户自动移动设置）
+- **总计**: ~80分钟
 
 ## 重要说明
 
@@ -209,6 +299,17 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`DatabaseName`].OutputValue' \
   --output text
 
+# 获取Normal OU ID
+aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text
+
+# 检查账户自动移动状态
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/AccountAutoMover \
+  --start-time $(date -d '1 hour ago' +%s)000
+
 # 查询Pro forma CUR数据示例
 aws athena start-query-execution \
   --query-string "SELECT line_item_product_code, SUM(line_item_blended_cost) as total_cost FROM athenacurcfn_123456789012.123456789012 WHERE year='2024' AND month='01' GROUP BY line_item_product_code ORDER BY total_cost DESC LIMIT 10" \
@@ -238,6 +339,16 @@ aws athena start-query-execution \
 4. **账户创建超时**
    - 等待最多30分钟
    - 检查AWS服务状态
+
+5. **EventBridge权限错误**
+   - 错误信息：`is not authorized to perform: events:DescribeRule`
+   - 解决方案：为setup_user添加`events:*`权限
+   - 参考上面的完整IAM策略
+
+6. **Module 6部署失败**
+   - 确认CloudTrail S3存储桶策略正确
+   - 检查EventBridge规则创建权限
+   - 验证Lambda函数权限
 
 ### 日志查看
 
