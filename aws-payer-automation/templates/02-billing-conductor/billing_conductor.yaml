@@ -29,6 +29,7 @@ Resources:
                   - organizations:DescribeCreateAccountStatus
                   - organizations:ListAccounts
                   - billingconductor:CreateBillingGroup
+                  - billingconductor:CreatePricingPlan
                   - billingconductor:AssociatePricingRules
                   - billingconductor:ListBillingGroups
                   - billingconductor:ListPricingPlans
@@ -289,35 +290,80 @@ Resources:
           def create_billing_group(billingconductor, primary_account_id):
               """创建BillingGroup"""
               try:
-                  # 首先列出可用的 pricing plans 来获取正确的 ARN
-                  pricing_plans = billingconductor.list_pricing_plans()
-                  print(f"Available pricing plans: {pricing_plans}")
+                  # 获取当前账户ID用于构建默认ARN
+                  import boto3
+                  sts = boto3.client('sts')
+                  account_id = sts.get_caller_identity()['Account']
+                  print(f"Current account ID: {account_id}")
                   
-                  # 查找标准定价计划
-                  standard_plan_arn = None
-                  for plan in pricing_plans.get('PricingPlans', []):
-                      if 'standard' in plan.get('Name', '').lower() or 'aws' in plan.get('Name', '').lower():
-                          standard_plan_arn = plan.get('Arn')
-                          print(f"Found standard pricing plan: {standard_plan_arn}")
-                          break
+                  # 首先尝试列出可用的 pricing plans
+                  try:
+                      pricing_plans = billingconductor.list_pricing_plans()
+                      print(f"Available pricing plans: {pricing_plans}")
+                      
+                      # 查找可用的定价计划
+                      standard_plan_arn = None
+                      for plan in pricing_plans.get('PricingPlans', []):
+                          plan_name = plan.get('Name', '')
+                          plan_arn = plan.get('Arn', '')
+                          print(f"Found pricing plan: {plan_name} - {plan_arn}")
+                          
+                          if 'standard' in plan_name.lower() or 'aws' in plan_name.lower() or 'default' in plan_name.lower():
+                              standard_plan_arn = plan_arn
+                              print(f"Selected pricing plan: {standard_plan_arn}")
+                              break
+                      
+                      # 如果没有找到标准计划，使用第一个可用的计划
+                      if not standard_plan_arn and pricing_plans.get('PricingPlans'):
+                          standard_plan_arn = pricing_plans['PricingPlans'][0].get('Arn')
+                          print(f"Using first available pricing plan: {standard_plan_arn}")
+                      
+                  except Exception as list_error:
+                      print(f"Error listing pricing plans: {str(list_error)}")
+                      standard_plan_arn = None
                   
-                  # 如果没有找到标准计划，使用第一个可用的计划
-                  if not standard_plan_arn and pricing_plans.get('PricingPlans'):
-                      standard_plan_arn = pricing_plans['PricingPlans'][0].get('Arn')
-                      print(f"Using first available pricing plan: {standard_plan_arn}")
-                  
+                  # 如果没有找到任何定价计划，尝试创建一个默认的
                   if not standard_plan_arn:
-                      # 如果还是没有找到，尝试不使用 ComputationPreference
-                      print("No pricing plan found, creating BillingGroup without ComputationPreference")
-                      response = billingconductor.create_billing_group(
-                          Name='Bills',
-                          Description='Billing group for customer original pricing',
-                          PrimaryAccountId=primary_account_id,
-                          AccountGrouping={
-                              'LinkedAccountIds': [primary_account_id]
-                          }
-                      )
-                  else:
+                      print("No existing pricing plans found, attempting to create default pricing plan")
+                      try:
+                          # 创建默认的定价计划
+                          pricing_plan_response = billingconductor.create_pricing_plan(
+                              Name='DefaultPricingPlan',
+                              Description='Default pricing plan for standard AWS pricing'
+                          )
+                          standard_plan_arn = pricing_plan_response['Arn']
+                          print(f"Created default pricing plan: {standard_plan_arn}")
+                      except Exception as create_plan_error:
+                          print(f"Failed to create default pricing plan: {str(create_plan_error)}")
+                          # 最后的备选方案：使用估计的ARN格式
+                          import random
+                          import string
+                          random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                          standard_plan_arn = f"arn:aws:billingconductor::{account_id}:pricingplan/{random_id}"
+                          print(f"Using fallback ARN: {standard_plan_arn}")
+                  
+                  # 创建 BillingGroup（ComputationPreference 是必需的）
+                  print(f"Creating BillingGroup with pricing plan: {standard_plan_arn}")
+                  response = billingconductor.create_billing_group(
+                      Name='Bills',
+                      Description='Billing group for customer original pricing',
+                      PrimaryAccountId=primary_account_id,
+                      AccountGrouping={
+                          'LinkedAccountIds': [primary_account_id]
+                      },
+                      ComputationPreference={
+                          'PricingPlanArn': standard_plan_arn
+                      }
+                  )
+                  
+                  print(f"BillingGroup created successfully: {response['Arn']}")
+                  return response['Arn']
+                  
+              except Exception as e:
+                  print(f"BillingGroup creation error: {str(e)}")
+                  # 如果还是失败，尝试最简单的创建方式
+                  try:
+                      print("Attempting simple BillingGroup creation without pricing plan specifics")
                       response = billingconductor.create_billing_group(
                           Name='Bills',
                           Description='Billing group for customer original pricing',
@@ -325,15 +371,12 @@ Resources:
                           AccountGrouping={
                               'LinkedAccountIds': [primary_account_id]
                           },
-                          ComputationPreference={
-                              'PricingPlanArn': standard_plan_arn
-                          }
+                          ComputationPreference={}  # 空的 ComputationPreference
                       )
-                  
-                  return response['Arn']
-              except Exception as e:
-                  print(f"BillingGroup creation error: {str(e)}")
-                  raise
+                      return response['Arn']
+                  except Exception as simple_error:
+                      print(f"Simple creation also failed: {str(simple_error)}")
+                      raise e
 
   # Custom Resource触发Lambda
   CreateAccountAndBillingGroup:
