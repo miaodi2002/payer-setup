@@ -75,13 +75,6 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
                 "iam:ListRoles"
             ],
             "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sts:AssumeRole"
-            ],
-            "Resource": "arn:aws:iam::*:role/OrganizationAccountAccessRole"
         }
     ]
 }
@@ -104,7 +97,6 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
 - `sns:*`: SNS消息服务权限（Module 7）
 - `cloudwatch:*`: CloudWatch监控和告警权限（Module 7）
 - **IAM权限限制**: 只允许角色管理相关权限，不包含用户和策略管理
-- **跨账户权限**: 允许AssumeRole到成员账户的OrganizationAccountAccessRole（Module 7需要）
 
 #### 权限验证脚本
 ```bash
@@ -178,10 +170,14 @@ else
 fi
 
 # OAM权限（Module 7）
-if aws oam list-sinks &> /dev/null; then
+if command -v aws &> /dev/null && aws oam list-sinks &> /dev/null 2>&1; then
     echo "✓ OAM access confirmed"
+elif ! aws oam help &> /dev/null 2>&1; then
+    echo "⚠ Warning: AWS CLI version too old for OAM commands (need v2.7+)"
+    echo "  Current version: $(aws --version | cut -d' ' -f1)"
+    echo "  Please upgrade AWS CLI to support Module 7 deployment"
 else
-    echo "✗ OAM access denied"
+    echo "✗ OAM access denied - check IAM permissions"
     exit 1
 fi
 
@@ -223,37 +219,10 @@ else
     exit 1
 fi
 
-# 跨账户权限测试（Module 7）
-echo "Testing cross-account permissions for Module 7..."
-MEMBER_ACCOUNTS=$(aws organizations list-accounts --query 'Accounts[?Status==`ACTIVE`].Id' --output text 2>/dev/null)
-
-if [ -n "$MEMBER_ACCOUNTS" ]; then
-    FIRST_ACCOUNT=$(echo $MEMBER_ACCOUNTS | awk '{print $1}')
-    if [ "$FIRST_ACCOUNT" != "$(aws sts get-caller-identity --query Account --output text)" ]; then
-        echo "Testing assume role to member account: $FIRST_ACCOUNT"
-        aws sts assume-role \
-          --role-arn "arn:aws:iam::$FIRST_ACCOUNT:role/OrganizationAccountAccessRole" \
-          --role-session-name "PermissionTest" \
-          --duration-seconds 900 &> /dev/null
-        
-        if [ $? -eq 0 ]; then
-            echo "✓ Cross-account assume role access confirmed"
-        else
-            echo "⚠ Warning: Cross-account assume role failed - Module 7 may have limited functionality"
-            echo "  This is expected if OrganizationAccountAccessRole doesn't exist in member accounts"
-        fi
-    else
-        echo "⚠ Warning: No member accounts found for cross-account testing"
-    fi
-else
-    echo "⚠ Warning: Could not retrieve member accounts list"
-fi
-
 echo ""
 echo "Permission check completed successfully"
 echo ""
 echo "All required permissions are available for AWS Payer automation deployment."
-echo "Note: Module 7 requires OrganizationAccountAccessRole in member accounts for full functionality."
 ```
 
 ### 3. AWS服务启用状态
@@ -575,53 +544,66 @@ else
     echo "✗ OAM access denied - check IAM permissions"
 fi
 
-# 获取所有成员账户ID
-MEMBER_ACCOUNTS=$(aws organizations list-accounts \
-  --query 'Accounts[?Status==`ACTIVE`].Id' \
-  --output text | tr '\t' ',')
-
-echo "Member Accounts: $MEMBER_ACCOUNTS"
-
-# 验证OrganizationAccountAccessRole存在（抽查一个账户）
-FIRST_ACCOUNT=$(echo $MEMBER_ACCOUNTS | cut -d',' -f1)
-aws sts assume-role \
-  --role-arn arn:aws:iam::$FIRST_ACCOUNT:role/OrganizationAccountAccessRole \
-  --role-session-name OAMTestSession &> /dev/null
-
-if [ $? -eq 0 ]; then
-    echo "✓ Cross-account access role verified"
-else
-    echo "⚠ Warning: Cross-account access may be limited"
-fi
+# Module 7 将自动发现AWS Organizations中的所有活跃成员账户
+echo "ℹ Module 7 将自动发现成员账户，并使用CloudFormation StackSets部署OAM Links"
 ```
 
 #### 7.2 部署执行
 
-##### 基本部署（推荐）
+##### 第一步：部署Payer账户监控基础设施
 ```bash
-# 使用默认100MB阈值
+# 获取Master Account名称作为Payer名称
+MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID --query 'Account.Name' --output text)
+
+echo "Payer Name: $PAYER_NAME"
+
+# 使用默认100MB阈值（成员账户自动发现）
 ./scripts/deploy-single.sh 7 \
-  --payer-name EliteSPP \
-  --member-accounts $MEMBER_ACCOUNTS
+  --payer-name "$PAYER_NAME"
+```
+
+##### 第二步：使用StackSet部署OAM Links到成员账户
+部署完成后，需要使用CloudFormation StackSet将OAM Links部署到所有成员账户：
+
+```bash
+# 获取OAM Sink ARN
+SINK_ARN=$(aws cloudformation describe-stacks \
+  --stack-name payer-cloudfront-monitoring-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' \
+  --output text)
+
+echo "OAM Sink ARN: $SINK_ARN"
+
+# 创建StackSet
+aws cloudformation create-stack-set \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
+  --parameters ParameterKey=OAMSinkArn,ParameterValue=$SINK_ARN ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
+  --capabilities CAPABILITY_IAM \
+  --description "Deploy OAM Links for CloudFront monitoring across member accounts"
+
+# 获取Organizations Root ID和Normal OU ID
+ROOT_ID=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+# 部署到Normal OU下的所有账户
+aws cloudformation create-stack-instances \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --deployment-targets OrganizationalUnitIds=$NORMAL_OU_ID \
+  --regions us-east-1
 ```
 
 ##### 自定义配置部署
 ```bash
 # 自定义阈值和Telegram群组
 ./scripts/deploy-single.sh 7 \
-  --payer-name EliteSPP \
-  --member-accounts $MEMBER_ACCOUNTS \
+  --payer-name "$PAYER_NAME" \
   --threshold-mb 150 \
   --telegram-group-id -862835857
-```
-
-##### 手动部署（如需要）
-```bash
-# 手动指定账户列表
-./scripts/deploy-single.sh 7 \
-  --payer-name EliteSPP \
-  --member-accounts 123456789012,234567890123,345678901234 \
-  --threshold-mb 100
 ```
 
 #### 7.3 验证CloudFront监控设置
@@ -648,7 +630,7 @@ aws oam list-sinks
 
 # 检查OAM设置日志
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
   --start-time $(date -d '30 minutes ago' +%s)000
 
 # 验证成员账户OAM Link（抽查）
@@ -669,7 +651,7 @@ aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
 
 # 查看告警配置详情
 aws cloudwatch describe-alarms \
-  --alarm-names "EliteSPP_CloudFront_Cross_Account_Traffic" \
+  --alarm-names "${PAYER_NAME}_CloudFront_Cross_Account_Traffic" \
   --query 'MetricAlarms[0].{Threshold:Threshold,Period:Period,MetricExpression:Metrics[0].Expression}'
 
 # 检查SNS Topic
@@ -679,14 +661,14 @@ aws sns list-topics | grep CloudFront
 ##### 验证Lambda函数
 ```bash
 # 检查Lambda函数状态
-aws lambda get-function --function-name EliteSPP-OAM-Setup \
+aws lambda get-function --function-name ${PAYER_NAME}-OAM-Setup \
   --query 'Configuration.{State:State,LastModified:LastModified}'
 
-aws lambda get-function --function-name EliteSPP-CloudFront-Alert \
+aws lambda get-function --function-name ${PAYER_NAME}-CloudFront-Alert \
   --query 'Configuration.{State:State,LastModified:LastModified}'
 
 # 查看环境变量配置
-aws lambda get-function-configuration --function-name EliteSPP-CloudFront-Alert \
+aws lambda get-function-configuration --function-name ${PAYER_NAME}-CloudFront-Alert \
   --query 'Environment.Variables'
 ```
 
@@ -705,7 +687,7 @@ cat > test-alarm.json << 'EOF'
   "Records": [
     {
       "Sns": {
-        "Message": "{\"AlarmName\":\"EliteSPP_CloudFront_Cross_Account_Traffic\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Test alarm\",\"Region\":\"us-east-1\"}"
+        "Message": "{\"AlarmName\":\"${PAYER_NAME}_CloudFront_Cross_Account_Traffic\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Test alarm\",\"Region\":\"us-east-1\"}"
       }
     }
   ]
@@ -713,7 +695,7 @@ cat > test-alarm.json << 'EOF'
 EOF
 
 aws lambda invoke \
-  --function-name EliteSPP-CloudFront-Alert \
+  --function-name ${PAYER_NAME}-CloudFront-Alert \
   --payload file://test-alarm.json \
   response.json
 
@@ -735,13 +717,13 @@ curl -X POST http://3.112.108.101:8509/api/sendout \
 ```bash
 # OAM设置日志
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
   --start-time $(date -d '1 hour ago' +%s)000 \
   --filter-pattern "Successfully created OAM Link"
 
 # 告警处理日志
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
   --start-time $(date -d '24 hours ago' +%s)000
 
 # CloudFormation事件
@@ -761,7 +743,7 @@ echo "时间: $(date)"
 # 检查告警状态
 echo "1. CloudWatch告警状态:"
 aws cloudwatch describe-alarms \
-  --alarm-names "EliteSPP_CloudFront_Cross_Account_Traffic" \
+  --alarm-names "${PAYER_NAME}_CloudFront_Cross_Account_Traffic" \
   --query 'MetricAlarms[0].{State:StateValue,Reason:StateReason}' \
   --output table
 
@@ -772,7 +754,7 @@ aws oam list-sinks --query 'Items[0].{Name:Name,Arn:Arn}' --output table
 # 检查最近告警日志
 echo "3. 最近1小时告警日志:"
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
   --start-time $(date -d '1 hour ago' +%s)000 \
   --query 'events[].message' \
   --output text | head -5
@@ -821,7 +803,7 @@ fi
 # 3. Telegram通知问题
 echo "检查Telegram配置:"
 aws lambda get-function-configuration \
-  --function-name EliteSPP-CloudFront-Alert \
+  --function-name ${PAYER_NAME}-CloudFront-Alert \
   --query 'Environment.Variables.{Group:TELEGRAM_GROUP_ID,Endpoint:TELEGRAM_API_ENDPOINT}' \
   --output table
 ```
@@ -876,7 +858,7 @@ aws oam list-links
 
 # 验证CloudFront监控（Module 7）
 aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
-aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `EliteSPP-`)].FunctionName'
+aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `${PAYER_NAME}-`)].FunctionName'
 ```
 
 ### 2. 功能测试

@@ -4,11 +4,8 @@ Description: "CloudFront traffic monitoring with intelligent OAM setup across mu
 Parameters:
   PayerName:
     Type: String
-    Description: "Name of the Payer (e.g., EliteSPP, ELITECLOUD)"
+    Description: "Name of the Payer (use Master Account name from AWS Organizations)"
     
-  MemberAccountIds:
-    Type: CommaDelimitedList
-    Description: "List of member account IDs to monitor (comma-separated)"
     
   CloudFrontThresholdMB:
     Type: Number
@@ -31,222 +28,24 @@ Resources:
     Type: AWS::Oam::Sink
     Properties:
       Name: !Sub "${PayerName}-monitoring-sink"
-      Policy: !Sub |
-        {
-          "Version": "2012-10-17",
-          "Statement": [
-            {
-              "Effect": "Allow",
-              "Principal": "*",
-              "Action": [
-                "oam:CreateLink",
-                "oam:UpdateLink"
-              ],
-              "Resource": "*",
-              "Condition": {
-                "ForAllValues:StringEquals": {
-                  "oam:ResourceTypes": [
-                    "AWS::CloudWatch::Metric",
-                    "AWS::Logs::LogGroup",
-                    "AWS::XRay::Trace",
-                    "AWS::ApplicationInsights::Application",
-                    "AWS::InternetMonitor::Monitor"
-                  ]
-                }
-              }
-            }
-          ]
-        }
-
-  # IAM Role for OAM Setup Lambda
-  OAMSetupRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${PayerName}-OAMSetupRole"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+      Policy:
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: OAMSetupPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - oam:*
-                  - sts:AssumeRole
-                  - organizations:ListAccounts
-                  - organizations:DescribeAccount
-                Resource: "*"
+            Principal: "*"
+            Action:
+              - "oam:CreateLink"
+              - "oam:UpdateLink"
+            Resource: "*"
+            Condition:
+              ForAllValues:StringEquals:
+                oam:ResourceTypes:
+                  - "AWS::CloudWatch::Metric"
+                  - "AWS::Logs::LogGroup"
+                  - "AWS::XRay::Trace"
+                  - "AWS::ApplicationInsights::Application"
+                  - "AWS::InternetMonitor::Monitor"
 
-  # Lambda function to setup OAM Links in member accounts
-  OAMSetupFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${PayerName}-OAM-Setup"
-      Runtime: ruby2.7
-      Handler: index.setup_handler
-      Role: !GetAtt OAMSetupRole.Arn
-      Timeout: 300
-      MemorySize: 512
-      Environment:
-        Variables:
-          SINK_ARN: !GetAtt MonitoringSink.Arn
-          MEMBER_ACCOUNTS: !Join [",", !Ref MemberAccountIds]
-          PAYER_NAME: !Ref PayerName
-      Code:
-        ZipFile: |
-          require 'json'
-          require 'aws-sdk-oam'
-          require 'aws-sdk-sts'
-          require 'aws-sdk-organizations'
-          
-          def setup_handler(event, context)
-            puts "Starting OAM setup process..."
-            
-            sink_arn = ENV['SINK_ARN']
-            member_accounts = ENV['MEMBER_ACCOUNTS'].split(',')
-            payer_name = ENV['PAYER_NAME']
-            
-            setup_results = []
-            
-            member_accounts.each do |account_id|
-              account_id = account_id.strip
-              next if account_id.empty?
-              
-              result = setup_oam_for_account(account_id, sink_arn, payer_name)
-              setup_results << result
-            end
-            
-            puts "OAM setup completed for #{setup_results.length} accounts"
-            
-            {
-              statusCode: 200,
-              body: JSON.generate({
-                message: "OAM setup completed",
-                results: setup_results
-              })
-            }
-          end
-          
-          def setup_oam_for_account(account_id, sink_arn, payer_name)
-            puts "Setting up OAM for account: #{account_id}"
-            
-            begin
-              # Check if OAM Link already exists
-              if oam_link_exists?(account_id, sink_arn)
-                puts "OAM Link already exists for account #{account_id}"
-                return {
-                  account_id: account_id,
-                  status: "exists",
-                  message: "OAM Link already configured"
-                }
-              end
-              
-              # Assume role in target account
-              assumed_credentials = assume_role_in_account(account_id)
-              
-              # Create OAM Link
-              create_oam_link(assumed_credentials, sink_arn, account_id, payer_name)
-              
-              puts "Successfully created OAM Link for account #{account_id}"
-              
-              {
-                account_id: account_id,
-                status: "created",
-                message: "OAM Link created successfully"
-              }
-              
-            rescue => e
-              puts "Failed to setup OAM for account #{account_id}: #{e.message}"
-              
-              {
-                account_id: account_id,
-                status: "failed",
-                message: e.message
-              }
-            end
-          end
-          
-          def assume_role_in_account(account_id)
-            sts = Aws::STS::Client.new
-            
-            # Try OrganizationAccountAccessRole first
-            role_arn = "arn:aws:iam::#{account_id}:role/OrganizationAccountAccessRole"
-            
-            begin
-              resp = sts.assume_role({
-                role_arn: role_arn,
-                role_session_name: "OAMSetupSession-#{Time.now.to_i}"
-              })
-              
-              {
-                access_key_id: resp.credentials.access_key_id,
-                secret_access_key: resp.credentials.secret_access_key,
-                session_token: resp.credentials.session_token,
-                region: ENV['AWS_REGION'] || 'us-east-1'
-              }
-              
-            rescue => e
-              puts "Failed to assume role in account #{account_id}: #{e.message}"
-              raise "Cannot assume role in account #{account_id}: #{e.message}"
-            end
-          end
-          
-          def create_oam_link(credentials, sink_arn, account_id, payer_name)
-            oam = Aws::Oam::Client.new(credentials)
-            
-            link_name = "#{payer_name}-monitoring-link"
-            
-            response = oam.create_link({
-              label_template: "$AccountName",
-              resource_types: [
-                "AWS::CloudWatch::Metric",
-                "AWS::Logs::LogGroup",
-                "AWS::XRay::Trace",
-                "AWS::ApplicationInsights::Application", 
-                "AWS::InternetMonitor::Monitor"
-              ],
-              sink_identifier: sink_arn,
-              tags: {
-                "PayerName" => payer_name,
-                "Purpose" => "CloudFrontMonitoring",
-                "ManagedBy" => "Module7"
-              }
-            })
-            
-            puts "Created OAM Link: #{response.arn}"
-            response
-          end
-          
-          def oam_link_exists?(account_id, sink_arn)
-            begin
-              # Assume role and check for existing links
-              assumed_credentials = assume_role_in_account(account_id)
-              oam = Aws::Oam::Client.new(assumed_credentials)
-              
-              links = oam.list_links
-              links.items.any? { |link| link.sink_arn == sink_arn }
-              
-            rescue => e
-              puts "Could not check existing OAM links for account #{account_id}: #{e.message}"
-              false
-            end
-          end
-
-  # Custom Resource to trigger OAM setup
-  OAMSetupTrigger:
-    Type: Custom::OAMSetup
-    Properties:
-      ServiceToken: !GetAtt OAMSetupFunction.Arn
-      PayerName: !Ref PayerName
-      MemberAccounts: !Ref MemberAccountIds
 
   # SNS Topic for CloudFront traffic alerts
   CloudFrontAlarmTopic:
@@ -279,12 +78,13 @@ Resources:
                   - cloudwatch:GetMetricData
                   - cloudwatch:GetMetricStatistics
                   - cloudwatch:ListMetrics
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
                 Resource: "*"
 
   # Lambda function for CloudFront traffic alerts
   CloudFrontAlertFunction:
     Type: AWS::Lambda::Function
-    DependsOn: OAMSetupTrigger
     Properties:
       FunctionName: !Sub "${PayerName}-CloudFront-Alert"
       Runtime: ruby2.7
@@ -297,7 +97,6 @@ Resources:
           PAYER_NAME: !Ref PayerName
           TELEGRAM_GROUP_ID: !Ref TelegramGroupId
           TELEGRAM_API_ENDPOINT: !Ref TelegramApiEndpoint
-          MEMBER_ACCOUNTS: !Join [",", !Ref MemberAccountIds]
           THRESHOLD_MB: !Ref CloudFrontThresholdMB
       Code:
         ZipFile: |
@@ -305,6 +104,7 @@ Resources:
           require 'net/http'
           require 'uri'
           require 'aws-sdk-cloudwatch'
+          require 'aws-sdk-organizations'
           require 'time'
           
           def alert_handler(event, context)
@@ -336,14 +136,32 @@ Resources:
           
           def find_high_usage_accounts
             cloudwatch = Aws::CloudWatch::Client.new
-            member_accounts = ENV['MEMBER_ACCOUNTS'].split(',')
+            organizations = Aws::Organizations::Client.new
             threshold_mb = ENV['THRESHOLD_MB'].to_i
             threshold_bytes = threshold_mb * 1024 * 1024
+            
+            # 动态获取所有活跃的成员账户
+            begin
+              # 获取Master Account ID
+              org_info = organizations.describe_organization
+              master_account_id = org_info.organization.master_account_id
+              
+              # 获取所有活跃账户，排除Master Account
+              accounts = organizations.list_accounts
+              member_accounts = accounts.accounts.select do |account|
+                account.status == 'ACTIVE' && account.id != master_account_id
+              end.map(&:id)
+              
+              puts "Found #{member_accounts.length} active member accounts to check"
+              
+            rescue => e
+              puts "Error getting member accounts: #{e.message}"
+              return []
+            end
             
             high_usage = []
             
             member_accounts.each do |account_id|
-              account_id = account_id.strip
               next if account_id.empty?
               
               begin
@@ -465,7 +283,6 @@ Resources:
   # CloudWatch Alarm for CloudFront traffic monitoring
   CloudFrontTrafficAlarm:
     Type: AWS::CloudWatch::Alarm
-    DependsOn: OAMSetupTrigger
     Properties:
       AlarmName: !Sub "${PayerName}_CloudFront_Cross_Account_Traffic"
       AlarmDescription: !Sub "Monitor CloudFront traffic across all ${PayerName} member accounts"

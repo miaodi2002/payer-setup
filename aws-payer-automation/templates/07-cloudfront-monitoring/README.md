@@ -19,7 +19,7 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 
 ### 安全特性
 - 最小权限IAM角色设计
-- 跨账户访问通过OrganizationAccountAccessRole
+- 自动账户发现通过Organizations API
 - Telegram Bot Token等敏感信息通过环境变量管理
 
 ## 架构图
@@ -35,8 +35,8 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 │             ▲                          │                   │
 │             │                          ▼                   │
 │  ┌─────────────────────┐    ┌─────────────────────┐        │
-│  │   OAM Setup        │    │    SNS Topic        │        │
-│  │   Lambda           │    └─────────────────────┘        │
+│  │ CloudFormation     │    │    SNS Topic        │        │
+│  │ StackSet           │    └─────────────────────┘        │
 │  └─────────────────────┘              │                   │
 │                                        ▼                   │
 │                              ┌─────────────────────┐        │
@@ -68,8 +68,7 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 
 ### OAM基础设施
 - **MonitoringSink**: 在Payer账户接收所有成员账户数据
-- **OAMSetupFunction**: 自动为成员账户创建OAM Link
-- **OAMSetupRole**: OAM设置Lambda的执行角色
+- **OAM Link StackSet**: 通过CloudFormation StackSet部署到成员账户的OAM Links
 
 ### 监控告警
 - **CloudFrontTrafficAlarm**: 监控总CloudFront流量的CloudWatch告警
@@ -77,14 +76,15 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 - **CloudFrontAlertFunction**: 处理告警并发送Telegram通知的Lambda函数
 
 ### IAM权限
-- **OAMSetupRole**: 包含OAM管理和跨账户AssumeRole权限
 - **CloudFrontAlertRole**: 包含CloudWatch查询权限
 
 ## 部署参数
 
 ### 必需参数
-- **PayerName**: Payer名称（如EliteSPP）
-- **MemberAccountIds**: 需要监控的成员账户ID列表（逗号分隔）
+- **PayerName**: Payer名称（动态获取Master Account名称）
+
+### 自动发现
+- **成员账户**: 自动从AWS Organizations发现所有活跃的成员账户
 
 ### 可选参数
 - **CloudFrontThresholdMB**: 流量阈值（默认100MB）
@@ -100,19 +100,50 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 
 ## 使用方法
 
-### 独立部署
+### 两步部署过程
+
+#### 第一步：部署Payer账户基础设施
 ```bash
-# 基本部署
+# 获取Master Account名称作为Payer名称
+MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID --query 'Account.Name' --output text)
+
+# 基本部署（成员账户自动发现）
 ./scripts/deploy-single.sh 7 \
-  --payer-name EliteSPP \
-  --member-accounts 123456789012,234567890123
+  --payer-name "$PAYER_NAME"
 
 # 自定义阈值和群组
 ./scripts/deploy-single.sh 7 \
-  --payer-name EliteSPP \
-  --member-accounts 123456789012,234567890123 \
+  --payer-name "$PAYER_NAME" \
   --threshold-mb 150 \
   --telegram-group-id -123456789
+```
+
+#### 第二步：使用StackSet部署OAM Links
+```bash
+# 获取OAM Sink ARN
+SINK_ARN=$(aws cloudformation describe-stacks \
+  --stack-name payer-cloudfront-monitoring-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' \
+  --output text)
+
+# 创建StackSet
+aws cloudformation create-stack-set \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
+  --parameters ParameterKey=OAMSinkArn,ParameterValue=$SINK_ARN ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
+  --capabilities CAPABILITY_IAM
+
+# 部署到Normal OU
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+aws cloudformation create-stack-instances \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --deployment-targets OrganizationalUnitIds=$NORMAL_OU_ID \
+  --regions us-east-1
 ```
 
 ### 验证部署
@@ -124,11 +155,11 @@ aws oam list-sinks
 aws oam list-links --account-id 123456789012
 
 # 检查CloudWatch告警
-aws cloudwatch describe-alarms --alarm-names "EliteSPP_CloudFront_Cross_Account_Traffic"
+aws cloudwatch describe-alarms --alarm-names "${PAYER_NAME}_CloudFront_Cross_Account_Traffic"
 
 # 查看Lambda函数
-aws lambda get-function --function-name EliteSPP-OAM-Setup
-aws lambda get-function --function-name EliteSPP-CloudFront-Alert
+aws lambda get-function --function-name ${PAYER_NAME}-OAM-Setup
+aws lambda get-function --function-name ${PAYER_NAME}-CloudFront-Alert
 ```
 
 ## 监控和日志
@@ -149,7 +180,7 @@ aws lambda get-function --function-name EliteSPP-CloudFront-Alert
 
 #### 告警处理日志
 ```
-[INFO] Processing alarm: EliteSPP_CloudFront_Cross_Account_Traffic, State: ALARM
+[INFO] Processing alarm: ${PAYER_NAME}_CloudFront_Cross_Account_Traffic, State: ALARM
 [INFO] Found 2 accounts exceeding threshold:
 [INFO]   - Account 123456789012: 156.7 MB
 [INFO]   - Account 234567890123: 134.2 MB
@@ -160,12 +191,12 @@ aws lambda get-function --function-name EliteSPP-CloudFront-Alert
 ```bash
 # 查看最近的OAM设置活动
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
   --start-time $(date -d '1 hour ago' +%s)000
 
 # 查看最近的告警活动
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
   --start-time $(date -d '1 hour ago' +%s)000
 
 # 检查CloudWatch指标
@@ -179,7 +210,7 @@ aws cloudwatch get-metric-data \
 
 ### 告警消息示例
 ```
-🚨 CloudFront流量告警 - EliteSPP
+🚨 CloudFront流量告警 - ${PAYER_NAME}
 
 📊 超量账户详情:
 ┌─────────────────────────
@@ -193,7 +224,7 @@ aws cloudwatch get-metric-data \
 └─────────────────────────
 
 📈 告警信息:
-• 告警名称: EliteSPP_CloudFront_Cross_Account_Traffic
+• 告警名称: ${PAYER_NAME}_CloudFront_Cross_Account_Traffic
 • 设定阈值: 100 MB
 • 监控周期: 15分钟
 • 告警时间: 2024-01-15 14:30:00 UTC
@@ -241,13 +272,13 @@ aws lambda list-functions --function-version ALL
 ```bash
 # 手动触发OAM设置
 aws lambda invoke \
-  --function-name EliteSPP-OAM-Setup \
+  --function-name ${PAYER_NAME}-OAM-Setup \
   --payload '{}' \
   response.json
 
 # 模拟告警测试
 aws lambda invoke \
-  --function-name EliteSPP-CloudFront-Alert \
+  --function-name ${PAYER_NAME}-CloudFront-Alert \
   --payload file://test-alarm.json \
   response.json
 ```

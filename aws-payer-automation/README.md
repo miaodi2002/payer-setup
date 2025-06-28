@@ -123,7 +123,9 @@
                 "cloudtrail:*",
                 "events:*",
                 "athena:*",
-                "oam:*"
+                "oam:*",
+                "sns:*",
+                "cloudwatch:*"
             ],
             "Resource": "*"
         },
@@ -218,8 +220,10 @@ NORMAL_OU_ID=$(aws cloudformation describe-stacks \
 # 部署Module 6
 ./scripts/deploy-single.sh 6 --normal-ou-id $NORMAL_OU_ID
 
-# 部署Module 7 (CloudFront监控)
-./scripts/deploy-single.sh 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123
+# 获取Master Account名称并部署Module 7 (CloudFront监控)
+MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID --query 'Account.Name' --output text)
+./scripts/deploy-single.sh 7 --payer-name "$PAYER_NAME"
 ```
 
 ## 项目结构
@@ -341,12 +345,12 @@ aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
 
 # 查看CloudFront告警日志
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-CloudFront-Alert \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
   --start-time $(date -d '24 hours ago' +%s)000
 
 # 检查OAM设置状态
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/EliteSPP-OAM-Setup \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
   --start-time $(date -d '1 hour ago' +%s)000
 ```
 

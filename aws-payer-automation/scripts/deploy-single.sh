@@ -52,7 +52,8 @@ show_usage() {
     echo "  6 - Account Auto Movement"
     echo "      Parameters: --normal-ou-id <ou_id> [--cloudtrail-mode auto|true|false]"
     echo "  7 - CloudFront Monitoring"
-    echo "      Parameters: --payer-name <name> --member-accounts <account1,account2> [--threshold-mb <number>] [--telegram-group-id <id>]"
+    echo "      Parameters: --payer-name <name> [--threshold-mb <number>] [--telegram-group-id <id>]"
+    echo "      Note: Member accounts are discovered automatically from AWS Organizations"
     echo ""
     echo "Examples:"
     echo "  $0 1 --root-id r-abcd1234"
@@ -64,8 +65,8 @@ show_usage() {
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode auto"
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode true"
     echo "  $0 6 --normal-ou-id ou-abcd-12345678 --cloudtrail-mode false"
-    echo "  $0 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123"
-    echo "  $0 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123 --threshold-mb 150"
+    echo "  $0 7 --payer-name YourPayerName"
+    echo "  $0 7 --payer-name YourPayerName --threshold-mb 150"
 }
 
 # Function to check if AWS CLI is configured
@@ -329,19 +330,12 @@ deploy_module6() {
 # Function to deploy module 7
 deploy_module7() {
     local payer_name=$1
-    local member_accounts=$2
-    local threshold_mb=$3
-    local telegram_group_id=$4
+    local threshold_mb=$2
+    local telegram_group_id=$3
     
     if [ -z "$payer_name" ]; then
         print_error "Payer name is required for Module 7"
-        print_status "Example: ./scripts/deploy-single.sh 7 --payer-name EliteSPP --member-accounts 123456789012,234567890123"
-        exit 1
-    fi
-    
-    if [ -z "$member_accounts" ]; then
-        print_error "Member account IDs are required for Module 7"
-        print_status "Example: --member-accounts 123456789012,234567890123,345678901234"
+        print_status "Example: ./scripts/deploy-single.sh 7 --payer-name YourPayerName"
         exit 1
     fi
     
@@ -356,24 +350,17 @@ deploy_module7() {
     
     print_status "Deploying Module 7: CloudFront Monitoring"
     print_status "Payer Name: $payer_name"
-    print_status "Member Accounts: $member_accounts"
     print_status "Threshold: $threshold_mb MB"
     print_status "Telegram Group: $telegram_group_id"
+    print_status "Member accounts will be discovered automatically from AWS Organizations"
     
     local stack_name="${STACK_PREFIX}-cloudfront-monitoring-${TIMESTAMP}"
-    
-    # Validate member accounts format
-    if ! echo "$member_accounts" | grep -qE '^[0-9,]+$'; then
-        print_error "Member accounts must be comma-separated account IDs (numbers only)"
-        exit 1
-    fi
     
     aws cloudformation create-stack \
         --stack-name "$stack_name" \
         --template-body file://templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml \
         --parameters \
             ParameterKey=PayerName,ParameterValue="$payer_name" \
-            ParameterKey=MemberAccountIds,ParameterValue="$member_accounts" \
             ParameterKey=CloudFrontThresholdMB,ParameterValue="$threshold_mb" \
             ParameterKey=TelegramGroupId,ParameterValue="$telegram_group_id" \
         --capabilities CAPABILITY_NAMED_IAM \
@@ -392,7 +379,7 @@ deploy_module7() {
     print_status "Alert Function: $alert_function"
     
     print_warning "CloudFront monitoring is now active with ${threshold_mb}MB threshold"
-    print_status "Member accounts: $(echo $member_accounts | tr ',' ' ')"
+    print_status "Monitoring all active member accounts in AWS Organizations"
     
     # Show setup results
     print_status ""
@@ -537,10 +524,6 @@ main() {
                         PAYER_NAME="$2"
                         shift 2
                         ;;
-                    --member-accounts)
-                        MEMBER_ACCOUNTS="$2"
-                        shift 2
-                        ;;
                     --threshold-mb)
                         THRESHOLD_MB="$2"
                         shift 2
@@ -556,7 +539,7 @@ main() {
                         ;;
                 esac
             done
-            deploy_module7 "$PAYER_NAME" "$MEMBER_ACCOUNTS" "$THRESHOLD_MB" "$TELEGRAM_GROUP_ID"
+            deploy_module7 "$PAYER_NAME" "$THRESHOLD_MB" "$TELEGRAM_GROUP_ID"
             ;;
         *)
             print_error "Invalid module number: $module"
