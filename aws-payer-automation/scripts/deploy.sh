@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # AWS Payer Automation - Complete Deployment Script
-# This script deploys all 6 modules in the correct order with dependency management
+# This script deploys all 7 modules in the correct order with dependency management
 
 set -e
 
@@ -245,12 +245,106 @@ deploy_module6() {
     print_status "CloudTrail Bucket: $CLOUDTRAIL_BUCKET"
 }
 
+# Function to enable CloudFormation StackSets trusted access
+enable_stacksets_trusted_access() {
+    print_status "Enabling CloudFormation StackSets trusted access with AWS Organizations"
+    
+    # Check if already enabled
+    TRUSTED_ACCESS=$(aws organizations list-aws-service-access-for-organization \
+        --query 'EnabledServicePrincipals[?ServicePrincipal==`member.org.stacksets.cloudformation.amazonaws.com`]' \
+        --output text 2>/dev/null)
+    
+    if [ -z "$TRUSTED_ACCESS" ]; then
+        aws organizations enable-aws-service-access \
+            --service-principal member.org.stacksets.cloudformation.amazonaws.com
+        print_success "CloudFormation StackSets trusted access enabled"
+    else
+        print_status "CloudFormation StackSets trusted access already enabled"
+    fi
+}
+
+# Function to deploy module 7 (CloudFront Monitoring)
+deploy_module7() {
+    print_status "Deploying Module 7: CloudFront Monitoring"
+    
+    # Enable StackSets trusted access first
+    enable_stacksets_trusted_access
+    
+    # Get Master Account name as Payer name
+    MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+    PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID --query 'Account.Name' --output text)
+    
+    print_status "Using parameters:"
+    print_status "  Master Account ID: $MASTER_ACCOUNT_ID"
+    print_status "  Payer Name: $PAYER_NAME"
+    
+    local stack_name="${STACK_PREFIX}-cloudfront-monitoring-${TIMESTAMP}"
+    
+    # Deploy CloudFront monitoring infrastructure in Payer account
+    aws cloudformation create-stack \
+        --stack-name "$stack_name" \
+        --template-body file://templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml \
+        --parameters \
+            ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
+            ParameterKey=CloudFrontThresholdMB,ParameterValue="100" \
+            ParameterKey=TelegramGroupId,ParameterValue="-862835857" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION"
+    
+    wait_for_stack "$stack_name" "create"
+    
+    STACK7_NAME="$stack_name"
+    MONITORING_SINK_ARN=$(get_stack_output "$stack_name" "MonitoringSinkArn")
+    
+    print_success "Module 7 infrastructure deployed successfully: $stack_name"
+    print_status "Monitoring Sink ARN: $MONITORING_SINK_ARN"
+    
+    # Create StackSet for OAM Links
+    local stackset_name="${PAYER_NAME}-OAM-Links"
+    
+    print_status "Creating StackSet for OAM Links: $stackset_name"
+    
+    aws cloudformation create-stack-set \
+        --stack-set-name "$stackset_name" \
+        --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
+        --parameters \
+            ParameterKey=OAMSinkArn,ParameterValue="$MONITORING_SINK_ARN" \
+            ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
+        --capabilities CAPABILITY_IAM \
+        --permission-model SERVICE_MANAGED \
+        --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+        --description "Deploy OAM Links for CloudFront monitoring across member accounts" \
+        --region "$REGION"
+    
+    # Wait a moment for StackSet to be created
+    sleep 10
+    
+    # Deploy StackSet to Normal OU
+    NORMAL_OU_ID=$(get_stack_output "$STACK1_NAME" "NormalOUId")
+    
+    print_status "Deploying StackSet to Normal OU: $NORMAL_OU_ID"
+    
+    aws cloudformation create-stack-instances \
+        --stack-set-name "$stackset_name" \
+        --deployment-targets OrganizationalUnitIds="$NORMAL_OU_ID" \
+        --regions "$REGION" \
+        --region "$REGION"
+    
+    # Wait for StackSet deployment (this may take a while)
+    print_status "Waiting for StackSet deployment to complete (this may take several minutes)"
+    sleep 30  # Give it some time to start
+    
+    STACKSET_NAME="$stackset_name"
+    print_success "Module 7 StackSet deployed successfully: $stackset_name"
+}
+
 # Function to print deployment summary
 print_summary() {
     print_success "=== Deployment Summary ==="
     echo "Timestamp: $TIMESTAMP"
     echo "Region: $REGION"
     echo "Root ID: $ROOT_ID"
+    echo "Payer Name: $PAYER_NAME"
     echo ""
     echo "Deployed Stacks:"
     echo "  1. OU and SCP: $STACK1_NAME"
@@ -259,17 +353,23 @@ print_summary() {
     echo "  4. RISP CUR: $STACK4_NAME"
     echo "  5. Athena Setup: $STACK5_NAME"
     echo "  6. Account Auto Movement: $STACK6_NAME"
+    echo "  7. CloudFront Monitoring: $STACK7_NAME"
+    echo ""
+    echo "Deployed StackSets:"
+    echo "  - OAM Links: $STACKSET_NAME"
     echo ""
     echo "Key Resources:"
     echo "  BillingGroup ARN: $BILLING_GROUP_ARN"
     echo "  Normal OU ID: $NORMAL_OU_ID"
     echo "  Athena Database: $DATABASE_NAME"
     echo "  CloudTrail Bucket: $CLOUDTRAIL_BUCKET"
+    echo "  Monitoring Sink ARN: $MONITORING_SINK_ARN"
     echo ""
-    print_success "All modules deployed successfully!"
+    print_success "All 7 modules deployed successfully!"
     print_warning "Note: CUR reports may take up to 24 hours to generate first data"
     print_warning "Note: Athena crawlers will start automatically but may take 10-15 minutes to complete"
     print_warning "Note: Account auto-movement is now active - new accounts will be automatically moved to Normal OU"
+    print_warning "Note: CloudFront monitoring is active with 100MB threshold - StackSet deployment to member accounts may take 10-15 minutes"
 }
 
 # Main deployment function
@@ -293,6 +393,7 @@ main() {
     deploy_module4
     deploy_module5
     deploy_module6
+    deploy_module7
     
     print_summary
 }
