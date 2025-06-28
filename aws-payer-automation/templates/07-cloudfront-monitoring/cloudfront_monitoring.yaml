@@ -87,8 +87,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${PayerName}-CloudFront-Alert"
-      Runtime: ruby2.7
-      Handler: index.alert_handler
+      Runtime: python3.12
+      Handler: index.lambda_handler
       Role: !GetAtt CloudFrontAlertRole.Arn
       Timeout: 120
       MemorySize: 256
@@ -100,185 +100,173 @@ Resources:
           THRESHOLD_MB: !Ref CloudFrontThresholdMB
       Code:
         ZipFile: |
-          require 'json'
-          require 'net/http'
-          require 'uri'
-          require 'aws-sdk-cloudwatch'
-          require 'aws-sdk-organizations'
-          require 'time'
+          import json
+          import boto3
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime, timedelta
+          import os
           
-          def alert_handler(event, context)
-            puts "Received CloudWatch alarm event: #{event.to_json}"
-            
-            event['Records'].each do |record|
-              sns_message = record['Sns']['Message']
-              message = JSON.parse(sns_message)
+          def lambda_handler(event, context):
+              print(f"Received CloudWatch alarm event: {json.dumps(event)}")
               
-              # Extract alarm information
-              alarm_name = message['AlarmName']
-              new_state = message['NewStateValue']
-              reason = message['NewStateReason']
-              region = message['Region']
-              
-              puts "Processing alarm: #{alarm_name}, State: #{new_state}"
-              
-              if new_state == 'ALARM'
-                # Find high usage accounts
-                high_usage_accounts = find_high_usage_accounts
-                
-                # Send Telegram alert
-                send_cloudfront_alert(alarm_name, high_usage_accounts, message)
-              end
-            end
-            
-            { statusCode: 200, body: JSON.generate('Success') }
-          end
-          
-          def find_high_usage_accounts
-            cloudwatch = Aws::CloudWatch::Client.new
-            organizations = Aws::Organizations::Client.new
-            threshold_mb = ENV['THRESHOLD_MB'].to_i
-            threshold_bytes = threshold_mb * 1024 * 1024
-            
-            # 动态获取所有活跃的成员账户
-            begin
-              # 获取Master Account ID
-              org_info = organizations.describe_organization
-              master_account_id = org_info.organization.master_account_id
-              
-              # 获取所有活跃账户，排除Master Account
-              accounts = organizations.list_accounts
-              member_accounts = accounts.accounts.select do |account|
-                account.status == 'ACTIVE' && account.id != master_account_id
-              end.map(&:id)
-              
-              puts "Found #{member_accounts.length} active member accounts to check"
-              
-            rescue => e
-              puts "Error getting member accounts: #{e.message}"
-              return []
-            end
-            
-            high_usage = []
-            
-            member_accounts.each do |account_id|
-              next if account_id.empty?
-              
-              begin
-                # Query CloudFront BytesDownloaded for specific account
-                response = cloudwatch.get_metric_data({
-                  metric_data_queries: [{
-                    id: "cloudfront_#{account_id.gsub('-', '_')}",
-                    metric_stat: {
-                      metric: {
-                        namespace: "AWS/CloudFront",
-                        metric_name: "BytesDownloaded"
-                      },
-                      period: 900, # 15 minutes
-                      stat: "Sum"
-                    },
-                    return_data: true
-                  }],
-                  start_time: Time.now - 900, # Last 15 minutes
-                  end_time: Time.now
-                })
-                
-                if response.metric_data_results.any? && !response.metric_data_results[0].values.empty?
-                  total_bytes = response.metric_data_results[0].values.sum
-                  total_mb = (total_bytes / 1024.0 / 1024.0).round(2)
+              for record in event['Records']:
+                  sns_message = record['Sns']['Message']
+                  message = json.loads(sns_message)
                   
-                  if total_bytes > threshold_bytes
-                    high_usage << {
-                      account_id: account_id,
-                      usage_mb: total_mb,
-                      usage_bytes: total_bytes
-                    }
-                  end
-                end
-                
-              rescue => e
-                puts "Error querying account #{account_id}: #{e.message}"
-              end
-            end
-            
-            # Sort by usage descending
-            high_usage.sort_by { |account| -account[:usage_mb] }
-          end
-          
-          def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details)
-            payer_name = ENV['PAYER_NAME']
-            threshold_mb = ENV['THRESHOLD_MB']
-            
-            # Build formatted message
-            message = build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
-            
-            # Send to Telegram
-            send_telegram_message(message)
-          end
-          
-          def build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
-            timestamp = Time.now.utc.strftime('%Y-%m-%d %H:%M:%S UTC')
-            
-            message = "🚨 CloudFront流量告警 - #{payer_name}\n\n"
-            
-            if high_usage_accounts.any?
-              message += "📊 超量账户详情:\n"
-              message += "┌─────────────────────────\n"
+                  # Extract alarm information
+                  alarm_name = message['AlarmName']
+                  new_state = message['NewStateValue']
+                  reason = message['NewStateReason']
+                  region = message['Region']
+                  
+                  print(f"Processing alarm: {alarm_name}, State: {new_state}")
+                  
+                  if new_state == 'ALARM':
+                      # Find high usage accounts
+                      high_usage_accounts = find_high_usage_accounts()
+                      
+                      # Send Telegram alert
+                      send_cloudfront_alert(alarm_name, high_usage_accounts, message)
               
-              high_usage_accounts.first(5).each_with_index do |account, index|
-                percentage = ((account[:usage_mb] / threshold_mb.to_f - 1) * 100).round(1)
-                message += "│ #{index + 1}. 账户: #{account[:account_id]}\n"
-                message += "│    用量: #{account[:usage_mb]} MB\n" 
-                message += "│    超出: +#{percentage}%\n"
-                message += "├─────────────────────────\n" unless index == high_usage_accounts.length - 1
-              end
-              
-              message += "└─────────────────────────\n\n"
-              
-              if high_usage_accounts.length > 5
-                message += "📋 另有 #{high_usage_accounts.length - 5} 个账户超限\n\n"
-              end
-            else
-              message += "📊 正在分析具体超量账户...\n\n"
-            end
-            
-            message += "📈 告警信息:\n"
-            message += "• 告警名称: #{alarm_name}\n"
-            message += "• 设定阈值: #{threshold_mb} MB\n"
-            message += "• 监控周期: 15分钟\n"
-            message += "• 告警时间: #{timestamp}\n\n"
-            
-            message += "⚠️ 建议立即检查CloudFront使用情况\n\n"
-            
-            message += "🔗 快速链接:\n"
-            message += "• CloudFront: https://console.aws.amazon.com/cloudfront\n"
-            message += "• CloudWatch: https://console.aws.amazon.com/cloudwatch"
-            
-            message
-          end
-          
-          def send_telegram_message(message)
-            begin
-              uri = URI.parse(ENV['TELEGRAM_API_ENDPOINT'])
-              params = {
-                'group' => ENV['TELEGRAM_GROUP_ID'],
-                'message' => message
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Success')
               }
+          
+          def find_high_usage_accounts():
+              cloudwatch = boto3.client('cloudwatch')
+              organizations = boto3.client('organizations')
+              threshold_mb = int(os.environ['THRESHOLD_MB'])
+              threshold_bytes = threshold_mb * 1024 * 1024
               
-              request = Net::HTTP::Post.new(uri)
-              request['Content-Type'] = 'application/x-www-form-urlencoded'
-              request.set_form_data(params)
+              # 动态获取所有活跃的成员账户
+              try:
+                  # 获取Master Account ID
+                  org_info = organizations.describe_organization()
+                  master_account_id = org_info['Organization']['MasterAccountId']
+                  
+                  # 获取所有活跃账户，排除Master Account
+                  accounts = organizations.list_accounts()
+                  member_accounts = [
+                      account['Id'] 
+                      for account in accounts['Accounts'] 
+                      if account['Status'] == 'ACTIVE' and account['Id'] != master_account_id
+                  ]
+                  
+                  print(f"Found {len(member_accounts)} active member accounts to check")
+                  
+              except Exception as e:
+                  print(f"Error getting member accounts: {str(e)}")
+                  return []
               
-              response = Net::HTTP.start(uri.hostname, uri.port) do |http|
-                http.request(request)
-              end
+              high_usage = []
               
-              puts "Telegram API Response: #{response.code} - #{response.body}"
+              for account_id in member_accounts:
+                  if not account_id:
+                      continue
+                  
+                  try:
+                      # Query CloudFront BytesDownloaded for specific account
+                      response = cloudwatch.get_metric_data(
+                          MetricDataQueries=[{
+                              'Id': f"cloudfront_{account_id.replace('-', '_')}",
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/CloudFront',
+                                      'MetricName': 'BytesDownloaded'
+                                  },
+                                  'Period': 900,  # 15 minutes
+                                  'Stat': 'Sum'
+                              },
+                              'ReturnData': True
+                          }],
+                          StartTime=datetime.now() - timedelta(minutes=15),
+                          EndTime=datetime.now()
+                      )
+                      
+                      if response['MetricDataResults'] and response['MetricDataResults'][0]['Values']:
+                          total_bytes = sum(response['MetricDataResults'][0]['Values'])
+                          total_mb = round(total_bytes / 1024.0 / 1024.0, 2)
+                          
+                          if total_bytes > threshold_bytes:
+                              high_usage.append({
+                                  'account_id': account_id,
+                                  'usage_mb': total_mb,
+                                  'usage_bytes': total_bytes
+                              })
+                      
+                  except Exception as e:
+                      print(f"Error querying account {account_id}: {str(e)}")
               
-            rescue => e
-              puts "Failed to send Telegram message: #{e.message}"
-            end
-          end
+              # Sort by usage descending
+              return sorted(high_usage, key=lambda x: x['usage_mb'], reverse=True)
+          
+          def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details):
+              payer_name = os.environ['PAYER_NAME']
+              threshold_mb = os.environ['THRESHOLD_MB']
+              
+              # Build formatted message
+              message = build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
+              
+              # Send to Telegram
+              send_telegram_message(message)
+          
+          def build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details):
+              timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+              
+              message = f"🚨 CloudFront流量告警 - {payer_name}\n\n"
+              
+              if high_usage_accounts:
+                  message += "📊 超量账户详情:\n"
+                  message += "┌─────────────────────────\n"
+                  
+                  for index, account in enumerate(high_usage_accounts[:5]):
+                      percentage = round((account['usage_mb'] / float(threshold_mb) - 1) * 100, 1)
+                      message += f"│ {index + 1}. 账户: {account['account_id']}\n"
+                      message += f"│    用量: {account['usage_mb']} MB\n"
+                      message += f"│    超出: +{percentage}%\n"
+                      if index < len(high_usage_accounts[:5]) - 1:
+                          message += "├─────────────────────────\n"
+                  
+                  message += "└─────────────────────────\n\n"
+                  
+                  if len(high_usage_accounts) > 5:
+                      message += f"📋 另有 {len(high_usage_accounts) - 5} 个账户超限\n\n"
+              else:
+                  message += "📊 正在分析具体超量账户...\n\n"
+              
+              message += "📈 告警信息:\n"
+              message += f"• 告警名称: {alarm_name}\n"
+              message += f"• 设定阈值: {threshold_mb} MB\n"
+              message += "• 监控周期: 15分钟\n"
+              message += f"• 告警时间: {timestamp}\n\n"
+              
+              message += "⚠️ 建议立即检查CloudFront使用情况\n\n"
+              
+              message += "🔗 快速链接:\n"
+              message += "• CloudFront: https://console.aws.amazon.com/cloudfront\n"
+              message += "• CloudWatch: https://console.aws.amazon.com/cloudwatch"
+              
+              return message
+          
+          def send_telegram_message(message):
+              try:
+                  url = os.environ['TELEGRAM_API_ENDPOINT']
+                  data = urllib.parse.urlencode({
+                      'group': os.environ['TELEGRAM_GROUP_ID'],
+                      'message': message
+                  }).encode('utf-8')
+                  
+                  req = urllib.request.Request(url, data=data, method='POST')
+                  req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+                  
+                  with urllib.request.urlopen(req) as response:
+                      response_body = response.read().decode('utf-8')
+                      print(f"Telegram API Response: {response.status} - {response_body}")
+                  
+              except Exception as e:
+                  print(f"Failed to send Telegram message: {str(e)}")
 
   # CloudWatch Alarm for CloudFront traffic monitoring
   CloudFrontTrafficAlarm:
