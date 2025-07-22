@@ -121,18 +121,24 @@ PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID 
 
 #### 第二步：使用StackSet部署OAM Links
 ```bash
+# 确保已激活CloudFormation StackSets与AWS Organizations的可信访问
+aws organizations enable-aws-service-access \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com
+
 # 获取OAM Sink ARN
 SINK_ARN=$(aws cloudformation describe-stacks \
   --stack-name payer-cloudfront-monitoring-* \
   --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' \
   --output text)
 
-# 创建StackSet
+# 创建StackSet（使用SERVICE_MANAGED权限模型）
 aws cloudformation create-stack-set \
   --stack-set-name "${PAYER_NAME}-OAM-Links" \
   --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
   --parameters ParameterKey=OAMSinkArn,ParameterValue=$SINK_ARN ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
-  --capabilities CAPABILITY_IAM
+  --capabilities CAPABILITY_IAM \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false
 
 # 部署到Normal OU
 NORMAL_OU_ID=$(aws cloudformation describe-stacks \

@@ -567,6 +567,16 @@ echo "Payer Name: $PAYER_NAME"
 部署完成后，需要使用CloudFormation StackSet将OAM Links部署到所有成员账户：
 
 ```bash
+# 首先，确保已激活CloudFormation StackSets与AWS Organizations的可信访问
+# 检查是否已激活
+aws organizations list-aws-service-access-for-organization \
+  --query 'EnabledServicePrincipals[?ServicePrincipal==`member.org.stacksets.cloudformation.amazonaws.com`]' \
+  --output table
+
+# 如果未激活，执行以下命令（或在AWS Console CloudFormation StackSets页面点击"Activate trusted access"）
+aws organizations enable-aws-service-access \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com
+
 # 获取OAM Sink ARN
 SINK_ARN=$(aws cloudformation describe-stacks \
   --stack-name payer-cloudfront-monitoring-* \
@@ -575,12 +585,14 @@ SINK_ARN=$(aws cloudformation describe-stacks \
 
 echo "OAM Sink ARN: $SINK_ARN"
 
-# 创建StackSet
+# 创建StackSet（使用SERVICE_MANAGED权限模型）
 aws cloudformation create-stack-set \
   --stack-set-name "${PAYER_NAME}-OAM-Links" \
   --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
   --parameters ParameterKey=OAMSinkArn,ParameterValue=$SINK_ARN ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
   --capabilities CAPABILITY_IAM \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
   --description "Deploy OAM Links for CloudFront monitoring across member accounts"
 
 # 获取Organizations Root ID和Normal OU ID
