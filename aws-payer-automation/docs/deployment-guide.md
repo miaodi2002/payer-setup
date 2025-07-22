@@ -13,6 +13,10 @@ graph TD
     A[Module 1: OU & SCP] --> B[Module 2: BillingConductor]
     B --> C[Module 3: Pro forma CUR]
     B -.-> D[Module 4: RISP CUR]
+    C --> E[Module 5: Athena Setup]
+    D --> E
+    A --> F[Module 6: Account Auto Movement]
+    A --> G[Module 7: CloudFront Monitoring]
     
     A1[Organizations Root ID] --> A
     B1[New Account Creation] --> B
@@ -20,6 +24,10 @@ graph TD
     
     C1[Pro forma S3 Bucket] --> C
     D1[RISP S3 Bucket] --> D
+    E1[CUR Buckets] --> E
+    F1[Normal OU ID] --> F
+    G1[Normal OU ID] --> G
+    G2[StackSets Trusted Access] --> G
 ```
 
 ### 资源创建时间线
@@ -30,6 +38,9 @@ graph TD
 | Module 2 | 15-30分钟 | **账户创建过程** |
 | Module 3 | 5-10分钟 | S3存储桶和CUR配置 |
 | Module 4 | 5-10分钟 | RISP S3存储桶和CUR配置 |
+| Module 5 | 10-15分钟 | Athena数据库和爬虫设置 |
+| Module 6 | 5-10分钟 | CloudTrail和Lambda配置 |
+| Module 7 | 15-25分钟 | **StackSet部署到成员账户** |
 
 ## 部署方式
 
@@ -75,21 +86,49 @@ cd aws-payer-automation
 [INFO] Deploying Module 4: RISP CUR Export
 [SUCCESS] Module 4 deployed successfully: payer-cur-risp-1699123456
 
+[INFO] Deploying Module 5: Athena Setup
+[SUCCESS] Module 5 deployed successfully: payer-athena-setup-1699123456
+
+[INFO] Deploying Module 6: Account Auto Movement
+[SUCCESS] Module 6 deployed successfully: payer-account-auto-move-1699123456
+
+[INFO] Deploying Module 7: CloudFront Monitoring
+[INFO] Enabling CloudFormation StackSets trusted access with AWS Organizations
+[SUCCESS] CloudFormation StackSets trusted access enabled
+[SUCCESS] Module 7 infrastructure deployed successfully: payer-cloudfront-monitoring-1699123456
+[INFO] Creating StackSet for OAM Links: YourPayerName-OAM-Links
+[SUCCESS] Module 7 StackSet deployed successfully: YourPayerName-OAM-Links
+
 === Deployment Summary ===
 Timestamp: 1699123456
 Region: us-east-1
 Root ID: r-abcd1234efgh5678
+Payer Name: YourPayerName
 
 Deployed Stacks:
   1. OU and SCP: payer-ou-scp-1699123456
   2. BillingConductor: payer-billing-conductor-1699123456
   3. Pro forma CUR: payer-cur-proforma-1699123456
   4. RISP CUR: payer-cur-risp-1699123456
+  5. Athena Setup: payer-athena-setup-1699123456
+  6. Account Auto Movement: payer-account-auto-move-1699123456
+  7. CloudFront Monitoring: payer-cloudfront-monitoring-1699123456
 
-BillingGroup ARN: arn:aws:billingconductor::123456789012:billinggroup/ABCDEFGH
+Deployed StackSets:
+  - OAM Links: YourPayerName-OAM-Links
 
-[SUCCESS] All modules deployed successfully!
+Key Resources:
+  BillingGroup ARN: arn:aws:billingconductor::123456789012:billinggroup/ABCDEFGH
+  Normal OU ID: ou-abcd-12345678
+  Athena Database: payer_athena_db
+  CloudTrail Bucket: payer-cloudtrail-bucket-1699123456
+  Monitoring Sink ARN: arn:aws:oam:us-east-1:123456789012:sink/YourPayerName-monitoring-sink
+
+[SUCCESS] All 7 modules deployed successfully!
 [WARNING] Note: CUR reports may take up to 24 hours to generate first data
+[WARNING] Note: Athena crawlers will start automatically but may take 10-15 minutes to complete
+[WARNING] Note: Account auto-movement is now active - new accounts will be automatically moved to Normal OU
+[WARNING] Note: CloudFront monitoring is active with 100MB threshold - StackSet deployment to member accounts may take 10-15 minutes
 ```
 
 ### 2. 分步骤部署

@@ -48,7 +48,10 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
                 "kms:*",
                 "cloudtrail:*",
                 "events:*",
-                "athena:*"
+                "athena:*",
+                "oam:*",
+                "sns:*",
+                "cloudwatch:*"
             ],
             "Resource": "*"
         },
@@ -90,6 +93,9 @@ aws organizations describe-account --account-id $(aws sts get-caller-identity --
 - `cloudtrail:*`: CloudTrail管理权限（Module 6）
 - `events:*`: EventBridge权限（Module 6）
 - `athena:*`: Athena查询引擎权限（Module 5）
+- `oam:*`: Observability Access Manager权限（Module 7）
+- `sns:*`: SNS消息服务权限（Module 7）
+- `cloudwatch:*`: CloudWatch监控和告警权限（Module 7）
 - **IAM权限限制**: 只允许角色管理相关权限，不包含用户和策略管理
 
 #### 权限验证脚本
@@ -163,6 +169,34 @@ else
     exit 1
 fi
 
+# OAM权限（Module 7）
+if command -v aws &> /dev/null && aws oam list-sinks &> /dev/null 2>&1; then
+    echo "✓ OAM access confirmed"
+elif ! aws oam help &> /dev/null 2>&1; then
+    echo "⚠ Warning: AWS CLI version too old for OAM commands (need v2.7+)"
+    echo "  Current version: $(aws --version | cut -d' ' -f1)"
+    echo "  Please upgrade AWS CLI to support Module 7 deployment"
+else
+    echo "✗ OAM access denied - check IAM permissions"
+    exit 1
+fi
+
+# SNS权限（Module 7）
+if aws sns list-topics &> /dev/null; then
+    echo "✓ SNS access confirmed"
+else
+    echo "✗ SNS access denied"
+    exit 1
+fi
+
+# CloudWatch权限（Module 7）
+if aws cloudwatch list-metrics --max-items 1 &> /dev/null; then
+    echo "✓ CloudWatch access confirmed"
+else
+    echo "✗ CloudWatch access denied"
+    exit 1
+fi
+
 # BillingConductor权限（Module 2）
 if aws billingconductor list-billing-groups --region us-east-1 &> /dev/null; then
     echo "✓ BillingConductor access confirmed"
@@ -185,6 +219,7 @@ else
     exit 1
 fi
 
+echo ""
 echo "Permission check completed successfully"
 echo ""
 echo "All required permissions are available for AWS Payer automation deployment."
@@ -498,6 +533,293 @@ aws cloudtrail get-trail-status --name bip-organizations-management-trail
 aws cloudtrail get-event-selectors --trail-name bip-organizations-management-trail
 ```
 
+### Step 7: 部署CloudFront跨账户监控（Module 7）
+
+#### 7.1 前置条件检查
+```bash
+# 验证OAM权限
+if aws oam list-sinks &> /dev/null; then
+    echo "✓ OAM access confirmed"
+else
+    echo "✗ OAM access denied - check IAM permissions"
+fi
+
+# Module 7 将自动发现AWS Organizations中的所有活跃成员账户
+echo "ℹ Module 7 将自动发现成员账户，并使用CloudFormation StackSets部署OAM Links"
+```
+
+#### 7.2 部署执行
+
+##### 第一步：部署Payer账户监控基础设施
+```bash
+# 获取Master Account名称作为Payer名称
+MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+PAYER_NAME=$(aws organizations describe-account --account-id $MASTER_ACCOUNT_ID --query 'Account.Name' --output text)
+
+echo "Payer Name: $PAYER_NAME"
+
+# 使用默认100MB阈值（成员账户自动发现）
+./scripts/deploy-single.sh 7 \
+  --payer-name "$PAYER_NAME"
+```
+
+##### 第二步：使用StackSet部署OAM Links到成员账户
+部署完成后，需要使用CloudFormation StackSet将OAM Links部署到所有成员账户：
+
+```bash
+# 首先，确保已激活CloudFormation StackSets与AWS Organizations的可信访问
+# 检查是否已激活
+aws organizations list-aws-service-access-for-organization \
+  --query 'EnabledServicePrincipals[?ServicePrincipal==`member.org.stacksets.cloudformation.amazonaws.com`]' \
+  --output table
+
+# 如果未激活，执行以下命令（或在AWS Console CloudFormation StackSets页面点击"Activate trusted access"）
+aws organizations enable-aws-service-access \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com
+
+# 获取OAM Sink ARN
+SINK_ARN=$(aws cloudformation describe-stacks \
+  --stack-name payer-cloudfront-monitoring-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' \
+  --output text)
+
+echo "OAM Sink ARN: $SINK_ARN"
+
+# 创建StackSet（使用SERVICE_MANAGED权限模型）
+aws cloudformation create-stack-set \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
+  --parameters ParameterKey=OAMSinkArn,ParameterValue=$SINK_ARN ParameterKey=PayerName,ParameterValue="$PAYER_NAME" \
+  --capabilities CAPABILITY_IAM \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --description "Deploy OAM Links for CloudFront monitoring across member accounts"
+
+# 获取Organizations Root ID和Normal OU ID
+ROOT_ID=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
+NORMAL_OU_ID=$(aws cloudformation describe-stacks \
+  --stack-name payer-ou-scp-* \
+  --query 'Stacks[0].Outputs[?OutputKey==`NormalOUId`].OutputValue' \
+  --output text)
+
+# 部署到Normal OU下的所有账户
+aws cloudformation create-stack-instances \
+  --stack-set-name "${PAYER_NAME}-OAM-Links" \
+  --deployment-targets OrganizationalUnitIds=$NORMAL_OU_ID \
+  --regions us-east-1
+```
+
+##### 自定义配置部署
+```bash
+# 自定义阈值和Telegram群组
+./scripts/deploy-single.sh 7 \
+  --payer-name "$PAYER_NAME" \
+  --threshold-mb 150 \
+  --telegram-group-id -862835857
+```
+
+#### 7.3 验证CloudFront监控设置
+
+##### 验证CloudFormation栈
+```bash
+# 检查栈状态
+STACK_NAME=$(aws cloudformation list-stacks \
+  --query 'StackSummaries[?starts_with(StackName, `payer-cloudfront-monitoring-`)].StackName' \
+  --output text)
+
+aws cloudformation describe-stacks --stack-name $STACK_NAME
+
+# 获取栈输出
+aws cloudformation describe-stacks \
+  --stack-name $STACK_NAME \
+  --query 'Stacks[0].Outputs'
+```
+
+##### 验证OAM基础设施
+```bash
+# 检查OAM Sink
+aws oam list-sinks
+
+# 检查OAM设置日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
+  --start-time $(date -d '30 minutes ago' +%s)000
+
+# 验证成员账户OAM Link（抽查）
+echo "Checking OAM Links in member accounts..."
+for account in $(echo $MEMBER_ACCOUNTS | tr ',' ' ' | head -3); do
+    echo "Checking account: $account"
+    # 这需要在成员账户中执行，或通过跨账户角色
+    aws sts assume-role \
+      --role-arn arn:aws:iam::$account:role/OrganizationAccountAccessRole \
+      --role-session-name OAMCheck &> /dev/null && echo "  ✓ Access OK" || echo "  ⚠ Access limited"
+done
+```
+
+##### 验证CloudWatch告警
+```bash
+# 检查CloudFront告警
+aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
+
+# 查看告警配置详情
+aws cloudwatch describe-alarms \
+  --alarm-names "${PAYER_NAME}_CloudFront_Cross_Account_Traffic" \
+  --query 'MetricAlarms[0].{Threshold:Threshold,Period:Period,MetricExpression:Metrics[0].Expression}'
+
+# 检查SNS Topic
+aws sns list-topics | grep CloudFront
+```
+
+##### 验证Lambda函数
+```bash
+# 检查Lambda函数状态
+aws lambda get-function --function-name ${PAYER_NAME}-OAM-Setup \
+  --query 'Configuration.{State:State,LastModified:LastModified}'
+
+aws lambda get-function --function-name ${PAYER_NAME}-CloudFront-Alert \
+  --query 'Configuration.{State:State,LastModified:LastModified}'
+
+# 查看环境变量配置
+aws lambda get-function-configuration --function-name ${PAYER_NAME}-CloudFront-Alert \
+  --query 'Environment.Variables'
+```
+
+#### 7.4 测试和验证
+
+##### 功能测试
+```bash
+# 测试CloudFront指标查询
+aws cloudwatch list-metrics \
+  --namespace AWS/CloudFront \
+  --metric-name BytesDownloaded
+
+# 手动测试告警Lambda（可选）
+cat > test-alarm.json << 'EOF'
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"AlarmName\":\"${PAYER_NAME}_CloudFront_Cross_Account_Traffic\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Test alarm\",\"Region\":\"us-east-1\"}"
+      }
+    }
+  ]
+}
+EOF
+
+aws lambda invoke \
+  --function-name ${PAYER_NAME}-CloudFront-Alert \
+  --payload file://test-alarm.json \
+  response.json
+
+cat response.json
+rm test-alarm.json response.json
+```
+
+##### Telegram通知测试
+```bash
+# 测试Telegram API连通性
+curl -X POST http://3.112.108.101:8509/api/sendout \
+  -d "group=-862835857&message=Module 7 部署测试 - CloudFront监控系统已启动" \
+  -H "Content-Type: application/x-www-form-urlencoded"
+```
+
+#### 7.5 监控和日志
+
+##### 查看部署日志
+```bash
+# OAM设置日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/${PAYER_NAME}-OAM-Setup \
+  --start-time $(date -d '1 hour ago' +%s)000 \
+  --filter-pattern "Successfully created OAM Link"
+
+# 告警处理日志
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
+  --start-time $(date -d '24 hours ago' +%s)000
+
+# CloudFormation事件
+aws cloudformation describe-stack-events \
+  --stack-name $STACK_NAME \
+  --max-items 10
+```
+
+##### 持续监控命令
+```bash
+# 创建监控脚本
+cat > monitor-cloudfront.sh << 'EOF'
+#!/bin/bash
+echo "=== CloudFront监控状态检查 ==="
+echo "时间: $(date)"
+
+# 检查告警状态
+echo "1. CloudWatch告警状态:"
+aws cloudwatch describe-alarms \
+  --alarm-names "${PAYER_NAME}_CloudFront_Cross_Account_Traffic" \
+  --query 'MetricAlarms[0].{State:StateValue,Reason:StateReason}' \
+  --output table
+
+# 检查OAM Sink
+echo "2. OAM Sink状态:"
+aws oam list-sinks --query 'Items[0].{Name:Name,Arn:Arn}' --output table
+
+# 检查最近告警日志
+echo "3. 最近1小时告警日志:"
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/${PAYER_NAME}-CloudFront-Alert \
+  --start-time $(date -d '1 hour ago' +%s)000 \
+  --query 'events[].message' \
+  --output text | head -5
+
+echo "=== 检查完成 ==="
+EOF
+
+chmod +x monitor-cloudfront.sh
+```
+
+#### 7.6 故障排除
+
+##### 常见问题诊断
+```bash
+# 1. OAM Link创建失败
+echo "检查OrganizationAccountAccessRole:"
+for account in $(echo $MEMBER_ACCOUNTS | tr ',' ' ' | head -3); do
+    echo "Account: $account"
+    aws sts assume-role \
+      --role-arn arn:aws:iam::$account:role/OrganizationAccountAccessRole \
+      --role-session-name DiagnosticCheck \
+      --duration-seconds 900 &> /dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Cross-account access OK"
+    else
+        echo "  ✗ Cross-account access failed"
+        echo "  解决方案: 检查Organizations信任关系或手动创建角色"
+    fi
+done
+
+# 2. CloudWatch告警不触发
+echo "检查CloudFront指标可用性:"
+metrics_count=$(aws cloudwatch list-metrics \
+  --namespace AWS/CloudFront \
+  --metric-name BytesDownloaded \
+  --query 'length(Metrics)' \
+  --output text)
+
+if [ "$metrics_count" -gt 0 ]; then
+    echo "✓ CloudFront指标可用 ($metrics_count 个指标)"
+else
+    echo "⚠ 警告: 未发现CloudFront指标，可能需要等待数据生成"
+fi
+
+# 3. Telegram通知问题
+echo "检查Telegram配置:"
+aws lambda get-function-configuration \
+  --function-name ${PAYER_NAME}-CloudFront-Alert \
+  --query 'Environment.Variables.{Group:TELEGRAM_GROUP_ID,Endpoint:TELEGRAM_API_ENDPOINT}' \
+  --output table
+```
+
 ## 验证和测试
 
 ### 1. 完整性检查
@@ -541,6 +863,14 @@ aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `Account
 
 # 验证CloudTrail（Module 6）
 aws cloudtrail describe-trails
+
+# 验证OAM基础设施（Module 7）
+aws oam list-sinks
+aws oam list-links
+
+# 验证CloudFront监控（Module 7）
+aws cloudwatch describe-alarms --alarm-names "*CloudFront*"
+aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `${PAYER_NAME}-`)].FunctionName'
 ```
 
 ### 2. 功能测试
