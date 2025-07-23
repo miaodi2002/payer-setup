@@ -3,6 +3,17 @@
 ## Overview
 This module creates a comprehensive Athena environment for analyzing both Pro forma and RISP CUR data. It automates the setup of Glue databases, crawlers, and Lambda functions for real-time data discovery and updates.
 
+## ⚠️ Important: Template Version Information
+
+**Recommended Template**: `athena_setup_simplified.yaml`
+
+**Template Options**:
+- `athena_setup.yaml` - Original template with Lambda inline code (has syntax issues)
+- `athena_setup_simplified.yaml` - Simplified version without inline Lambda (recommended)
+
+**Why Use The Simplified Version?**
+The original template contains Lambda inline code syntax errors that cause deployment failures. The simplified version removes the Lambda-in-Lambda logic and provides better reliability.
+
 ## Resources Created
 - **Glue Database**: `athenacurcfn_{account_id}` - Unified database for all CUR tables
 - **Glue Crawlers**: 
@@ -35,6 +46,8 @@ This module creates a comprehensive Athena environment for analyzing both Pro fo
 - `RISPReportName`: RISP CUR report name (from Module 4)
 
 ## Deployment
+
+### Using Simplified Template (Recommended)
 ```bash
 # Get parameters from previous modules
 PROFORMA_BUCKET=$(aws cloudformation describe-stacks \
@@ -57,16 +70,25 @@ RISP_REPORT=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`RISPReportName`].OutputValue' \
   --output text)
 
-# Deploy Module 5
+# Deploy Module 5 with simplified template
 aws cloudformation create-stack \
   --stack-name payer-athena-setup-$(date +%s) \
-  --template-body file://athena_setup.yaml \
+  --template-body file://athena_setup_simplified.yaml \
   --parameters \
     ParameterKey=ProformaBucketName,ParameterValue=$PROFORMA_BUCKET \
     ParameterKey=RISPBucketName,ParameterValue=$RISP_BUCKET \
     ParameterKey=ProformaReportName,ParameterValue=$PROFORMA_REPORT \
     ParameterKey=RISPReportName,ParameterValue=$RISP_REPORT \
   --capabilities CAPABILITY_NAMED_IAM
+```
+
+### Using Original Template (Not Recommended)
+The original template may fail due to Lambda inline code syntax issues:
+```bash
+# Only use if you've fixed the Lambda inline code syntax
+aws cloudformation create-stack \
+  --template-body file://athena_setup.yaml \
+  # ... same parameters as above
 ```
 
 ## Resources Structure
@@ -178,6 +200,19 @@ ORDER BY cost_difference DESC;
 
 ## Troubleshooting
 
+### Template Issues
+
+1. **Runtime.UserCodeSyntaxError**
+   - **Cause**: Lambda inline code syntax error in original template
+   - **Error**: `lambda_code = |` syntax is invalid in CloudFormation
+   - **Solution**: Use `athena_setup_simplified.yaml` template
+   - **Alternative**: Fix inline code syntax and add IAM PassRole permissions
+
+2. **IAM PassRole Permission Error**
+   - **Cause**: Lambda cannot pass role to Glue crawler
+   - **Solution**: Ensure Lambda execution role has PassRole permission for GlueCrawlerRole
+   - **Fixed in**: Simplified template includes proper IAM permissions
+
 ### Common Issues
 
 1. **Crawler not starting**: Check IAM roles and S3 permissions
@@ -197,9 +232,20 @@ aws logs describe-log-groups --log-group-name-prefix /aws/lambda/AWSCURInitializ
 aws glue start-crawler --name AWSCURCrawler-$(aws sts get-caller-identity --query Account --output text)
 ```
 
+## Template Comparison
+
+| Feature | Original Template | Simplified Template |
+|---------|------------------|--------------------|
+| Lambda Inline Code | ✅ Yes (with syntax issues) | ❌ No |
+| Deployment Reliability | ⚠️ May fail | ✅ Reliable |
+| IAM PassRole Setup | ⚠️ Manual fix needed | ✅ Included |
+| Functionality | Full | Full |
+| Maintenance | Complex | Simple |
+
 ## Notes
 - Tables are automatically partitioned by year/month
 - Initial crawler run may take 10-15 minutes
 - S3 notifications may take a few minutes to configure
 - Status tables help track CUR data availability
 - All resources follow AWS naming conventions
+- **Recommended**: Always use the simplified template for new deployments
