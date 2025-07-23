@@ -62,6 +62,7 @@
 - 设置Lambda函数处理自动化数据发现
 - 配置S3事件通知自动触发数据更新
 - 创建状态表跟踪CUR数据生成状态
+- ⚠️ **注意**: 使用简化版模板 `athena_setup_simplified.yaml`
 
 ### Module 6: 账户自动移动
 - 监控AWS Organizations事件（CreateAccountResult、AcceptHandshake）
@@ -208,7 +209,7 @@ RISP_BUCKET=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`RISPBucketName`].OutputValue' \
   --output text)
 
-# 部署Module 5
+# 部署Module 5（使用简化版模板）
 ./scripts/deploy-single.sh 5 --proforma-bucket $PROFORMA_BUCKET --risp-bucket $RISP_BUCKET --proforma-report $ACCOUNT_ID --risp-report risp-$ACCOUNT_ID
 
 # 获取Normal OU ID并部署Module 6
@@ -245,7 +246,8 @@ aws-payer-automation/
 │   │   ├── cur_export_risp.yaml # RISP CUR
 │   │   └── README.md
 │   ├── 05-athena-setup/
-│   │   ├── athena_setup.yaml    # Athena环境设置
+│   │   ├── athena_setup.yaml    # Athena环境设置（原版，有语法问题）
+│   │   ├── athena_setup_simplified.yaml # 简化版（推荐使用）
 │   │   └── README.md
 │   ├── 06-account-auto-management/
 │   │   ├── account_auto_move.yaml # 账户自动移动
@@ -378,10 +380,27 @@ aws logs filter-log-events \
    - 解决方案：为setup_user添加`events:*`权限
    - 参考上面的完整IAM策略
 
-6. **Module 6部署失败**
+6. **Module 5 Lambda内联代码语法错误**
+   - 错误信息：`Runtime.UserCodeSyntaxError`
+   - 原因：`athena_setup.yaml`中Lambda内联代码语法错误
+   - 解决方案：使用`athena_setup_simplified.yaml`模板
+   - 或者添加必要的IAM PassRole权限
+
+7. **Module 6账户移动失败**
+   - 问题1：JSON键大小写错误（`Type`应为`type`，`Id`应为`id`）
+   - 问题2：AcceptHandshake事件中使用错误的master账户ID字段
+   - 解决方案：使用`recipientAccountId`而非`userIdentity.accountId`
+   - 状态：✅ 已在`account_auto_move_fixed.yaml`中修复
+
+8. **Module 6部署失败**
    - 确认CloudTrail S3存储桶策略正确
    - 检查EventBridge规则创建权限
    - 验证Lambda函数权限
+
+9. **Module 7 StackSet部署失败**
+   - 错误信息：缺少`AWSCloudFormationStackSetAdministrationRole`
+   - 解决方案：创建必要的StackSet IAM角色或使用SERVICE_MANAGED权限模型
+   - 状态：⚠️ 核心监控功能已部署（80%完成），StackSet集成待完善
 
 ### 日志查看
 

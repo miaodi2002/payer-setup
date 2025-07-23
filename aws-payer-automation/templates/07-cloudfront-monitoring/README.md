@@ -100,6 +100,21 @@ Module 7实现CloudFront流量的跨账户监控系统，通过AWS Observability
 
 ## 使用方法
 
+### 部署要求和前置条件
+
+⚠️ **重要**: 本模组依赖CloudFormation StackSets功能，需要特定的IAM角色和权限配置。
+
+#### 必要的IAM角色（StackSet部署需要）
+部署成员账户OAM Links时需要以下角色：
+
+1. **Payer账户中需要**:
+   - `AWSCloudFormationStackSetAdministrationRole`
+   
+2. **成员账户中需要**:
+   - `AWSCloudFormationStackSetExecutionRole`
+
+或者使用**SERVICE_MANAGED**权限模型并启用Organizations集成。
+
 ### 两步部署过程
 
 #### 第一步：部署Payer账户基础设施
@@ -246,17 +261,26 @@ aws cloudwatch get-metric-data \
 
 ### 常见问题
 
-1. **OAM Link创建失败**
+1. **StackSet部署失败** ⚠️ 最常见问题
+   - **错误信息**: `Account should have 'AWSCloudFormationStackSetAdministrationRole' role`
+   - **原因**: 缺少必要的StackSet IAM角色
+   - **解决方案**:
+     - 方敲1: 创建必要的IAM角色
+     - 方敲2: 使用SERVICE_MANAGED权限模型
+     - 方敲3: 手动在成员账户部署OAM Links
+   - **影响**: 核心监控功能正常（80%完成），但需要手动完成成员账户集成
+
+2. **OAM Link创建失败**
    - 检查OrganizationAccountAccessRole是否存在
    - 验证跨账户权限配置
    - 查看OAM Setup Lambda日志
 
-2. **告警未触发**
+3. **告警未触发**
    - 确认CloudFront有实际流量
    - 检查OAM数据是否正常同步
    - 验证CloudWatch告警配置
 
-3. **Telegram通知失败**
+4. **Telegram通知失败**
    - 检查API端点是否可访问
    - 验证群组ID是否正确
    - 查看Alert Lambda日志
@@ -329,6 +353,63 @@ aws lambda invoke \
 ### 总计
 约$0.82/月（基于正常使用量）
 
+## 部署状态和StackSet问题
+
+### 当前部署状态: 80%完成 ⚠️
+
+**成功部署的组件**:
+- ✅ Payer账户OAM Sink配置
+- ✅ CloudWatch告警系统
+- ✅ Lambda告警处理
+- ✅ SNS集成
+- ✅ 自动账户发现
+
+**待完善的部分**:
+- ⚠️ 成员账户OAM Links部署（StackSet角色问题）
+- ⚠️ 端到端测试验证
+
+### StackSet角色解决方案
+
+#### 方案A: 创建必要的IAM角色
+```bash
+# 在Payer账户创建管理角色
+aws iam create-role --role-name AWSCloudFormationStackSetAdministrationRole \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "cloudformation.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+# 在成员账户创建执行角色
+aws iam create-role --role-name AWSCloudFormationStackSetExecutionRole \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::PAYER_ACCOUNT_ID:role/AWSCloudFormationStackSetAdministrationRole"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+```
+
+#### 方案B: 使用SERVICE_MANAGED权限模型（推荐）
+```bash
+# 启用Organizations集成
+aws organizations enable-aws-service-access \
+  --service-principal stacksets.cloudformation.amazonaws.com
+
+# 使用SERVICE_MANAGED模型创建StackSet
+aws cloudformation create-stack-set \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false
+```
+
+#### 方案C: 手动部署OAM Links
+在每个成员账户手动部署OAM Link CloudFormation Stack。
+
 ## 版本历史
 
 ### v1.0
@@ -337,6 +418,7 @@ aws lambda invoke \
 - 自动账户超量识别
 - 跨账户权限管理
 - 智能OAM基础设施检测和设置
+- ⚠️ 已知问题: StackSet IAM角色缺失造成成员账户集成不完整
 
 ## 最佳实践
 

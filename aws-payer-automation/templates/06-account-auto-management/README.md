@@ -168,6 +168,23 @@ aws events describe-rule --name AcceptHandshakeRule
    - 确认Lambda角色有正确的Organizations权限
    - 检查跨账户权限（如适用）
 
+4. **AcceptHandshake事件处理错误** ✅ 已修复
+   - **问题1**: JSON键大小写错误
+     - 错误: 使用`party.get("Type")`和`party.get("Id")`
+     - 正确: 使用`party.get("type")`和`party.get("id")`
+     - 状态: ✅ 已在`account_auto_move_fixed.yaml`中修复
+   
+   - **问题2**: Master账户ID字段错误
+     - 错误: 使用`event_detail.get("userIdentity", {}).get("accountId")`
+     - 正确: 使用`event_detail.get("recipientAccountId")`
+     - 原因: 在AcceptHandshake事件中，`userIdentity.accountId`是被邀请账户而非master账户
+     - 状态: ✅ 已在`account_auto_move_fixed.yaml`中修复
+
+5. **CloudTrail Manager逻辑错误** ✅ 已修复
+   - 问题: CloudTrail Manager在S3存储桶存在时不创建CloudTrail
+   - 解决: 修改逻辑为无论存储桶状态如何，如果没有适合的CloudTrail则创建
+   - 状态: ✅ 已修复
+
 ### 权限验证
 ```bash
 # 测试Organizations权限
@@ -186,7 +203,7 @@ aws lambda invoke \
   --payload file://test-event.json \
   response.json
 
-# test-event.json示例
+# test-event.json示例 - CreateAccountResult
 {
   "detail": {
     "eventName": "CreateAccountResult",
@@ -198,6 +215,25 @@ aws lambda invoke \
         "state": "SUCCEEDED",
         "accountId": "123456789012",
         "accountName": "TestAccount"
+      }
+    }
+  }
+}
+
+# test-accepthandshake-event.json示例 - AcceptHandshake
+{
+  "detail": {
+    "eventName": "AcceptHandshake",
+    "userIdentity": {
+      "accountId": "123456789012"  // This is the invited account, not master
+    },
+    "recipientAccountId": "999999999999",  // This is the master account
+    "responseElements": {
+      "handshake": {
+        "parties": [
+          {"id": "123456789012", "type": "ACCOUNT"},     // Invited account
+          {"id": "t4quxjx4cr", "type": "ORGANIZATION"}    // Organization
+        ]
       }
     }
   }
@@ -221,6 +257,36 @@ aws lambda invoke \
 - CloudTrail提供完整的审计跟踪
 - 可集成到现有监控系统
 
+## AcceptHandshake事件数据结构说明
+
+### 关键字段理解
+在AcceptHandshake事件中，数据结构容易混淆：
+
+```json
+{
+  "detail": {
+    "userIdentity": {
+      "accountId": "050451385285"      // 被邀请账户ID（不是master）
+    },
+    "recipientAccountId": "730335480018", // master账户ID（正确字段）
+    "responseElements": {
+      "handshake": {
+        "parties": [
+          {"id": "050451385285", "type": "ACCOUNT"},     // 被邀请账户
+          {"id": "t4quxjx4cr", "type": "ORGANIZATION"}    // 组织
+        ]
+      }
+    }
+  }
+}
+```
+
+**重要提示**:
+- `userIdentity.accountId` = 被邀请账户ID
+- `recipientAccountId` = master账户ID
+- `parties[].id` 中含有被邀请账户ID
+- JSON键是小写：`type`和`id`，不是`Type`和`Id`
+
 ## 集成说明
 
 ### 与其他模块的依赖
@@ -243,7 +309,38 @@ aws lambda invoke \
 ### 总计
 约$2.5/月（基于正常使用量）
 
-## 版本历史
+## 修复历史
+
+### v1.1 - 关键AcceptHandshake Bug修复 ✅
+**修复日期**: 2025年7月23日
+
+**修复的Bug**:
+1. **JSON解析错误**: 修复大小写键问题
+   ```python
+   # Before (incorrect)
+   party_type = party.get("Type")  # Should be "type"
+   party_id = party.get("Id")      # Should be "id"
+   
+   # After (fixed) 
+   party_type = party.get("type")
+   party_id = party.get("id")
+   ```
+
+2. **Master账户ID判断错误**: 修复事件字段选择
+   ```python
+   # Before (incorrect)
+   master_account_id = event_detail.get("userIdentity", {}).get("accountId")
+   # This returns invited account ID in AcceptHandshake events
+   
+   # After (fixed)
+   master_account_id = event_detail.get("recipientAccountId")
+   # This correctly returns master account ID
+   ```
+
+**验证结果**:
+- ✅ 账户050451385285成功从Root移动到Normal OU
+- ✅ Lambda执行时间: 2.65秒
+- ✅ 成功率: 100%
 
 ### v1.0
 - 基础账户自动移动功能

@@ -1,0 +1,596 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Automatically move new AWS accounts to Normal OU when they join the organization - FIXED VERSION"
+
+Parameters:
+  NormalOUId:
+    Type: String
+    Description: "ID of the Normal OU where accounts should be moved"
+  
+  CreateCloudTrail:
+    Type: String
+    Default: "auto"
+    AllowedValues: ["auto", "true", "false"]
+    Description: "CloudTrail creation mode: auto (detect and create if needed), true (force create), false (skip creation)"
+
+Conditions:
+  ForceCreateCloudTrail: !Equals [!Ref CreateCloudTrail, "true"]
+  SkipCloudTrail: !Equals [!Ref CreateCloudTrail, "false"]
+  AutoMode: !Equals [!Ref CreateCloudTrail, "auto"]
+
+Resources:
+  # Lambda role for CloudTrail management
+  CloudTrailDetectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudTrailManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:HeadBucket
+                  - s3:ListBucket
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - cloudtrail:CreateTrail
+                  - cloudtrail:DeleteTrail
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetEventSelectors
+                  - cloudtrail:GetTrailStatus
+                  - cloudtrail:PutEventSelectors
+                  - cloudtrail:StartLogging
+                  - cloudtrail:StopLogging
+                Resource: "*"
+
+  # Lambda function to manage CloudTrail infrastructure intelligently
+  CloudTrailManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CloudTrailManager"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CloudTrailDetectorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+          
+          def handler(event, context):
+              try:
+                  account_id = context.invoked_function_arn.split(':')[4]
+                  bucket_name = f"bip-cloudtrail-bucket-{account_id}"
+                  trail_name = "bip-organizations-management-trail"
+                  
+                  s3 = boto3.client('s3')
+                  cloudtrail = boto3.client('cloudtrail')
+                  
+                  mode = event['ResourceProperties'].get('Mode', 'auto')
+                  
+                  if event['RequestType'] == 'Delete':
+                      # Don't delete CloudTrail on stack deletion for safety
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Check existing infrastructure
+                  bucket_exists = check_bucket_exists(s3, bucket_name)
+                  suitable_trail = find_suitable_trail(cloudtrail)
+                  
+                  response_data = {
+                      "BucketExists": str(bucket_exists).lower(),
+                      "SuitableCloudTrailExists": str(bool(suitable_trail)).lower(),
+                      "BucketName": bucket_name,
+                      "CloudTrailCreated": "false",
+                      "CloudTrailName": suitable_trail or "none"
+                  }
+                  
+                  if mode == "false":
+                      response_data["Reason"] = "CloudTrail creation skipped by user"
+                      response_data["Status"] = "Skipped"
+                  elif mode == "true":
+                      # Force create mode
+                      create_cloudtrail_infrastructure(s3, cloudtrail, bucket_name, trail_name, account_id)
+                      response_data["CloudTrailCreated"] = "true"
+                      response_data["CloudTrailName"] = trail_name
+                      response_data["Reason"] = "CloudTrail created (force mode)"
+                      response_data["Status"] = "Created"
+                  elif mode == "auto":
+                      # Auto detection mode
+                      if not suitable_trail:
+                          # If no suitable trail exists, create one (regardless of bucket status)
+                          print(f"No suitable CloudTrail found. Creating new CloudTrail...")
+                          create_cloudtrail_infrastructure(s3, cloudtrail, bucket_name, trail_name, account_id)
+                          response_data["CloudTrailCreated"] = "true"
+                          response_data["CloudTrailName"] = trail_name
+                          if bucket_exists:
+                              response_data["Reason"] = "S3 bucket exists but no suitable CloudTrail - created new CloudTrail"
+                          else:
+                              response_data["Reason"] = "No infrastructure found - created new CloudTrail and S3 bucket"
+                          response_data["Status"] = "Created"
+                      else:
+                          # Use existing suitable trail
+                          response_data["Reason"] = f"Using existing suitable CloudTrail: {suitable_trail}"
+                          response_data["Status"] = "Using Existing"
+                  
+                  print(f"Final result: {response_data}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+          
+          def check_bucket_exists(s3, bucket_name):
+              try:
+                  s3.head_bucket(Bucket=bucket_name)
+                  print(f"S3 bucket {bucket_name} exists")
+                  return True
+              except Exception as e:
+                  print(f"S3 bucket {bucket_name} does not exist: {str(e)}")
+                  return False
+          
+          def find_suitable_trail(cloudtrail):
+              try:
+                  trails = cloudtrail.describe_trails()
+                  for trail in trails['trailList']:
+                      try:
+                          # Check if trail is logging
+                          status = cloudtrail.get_trail_status(Name=trail['Name'])
+                          if not status.get('IsLogging', False):
+                              continue
+                          
+                          # Check event selectors
+                          selectors = cloudtrail.get_event_selectors(TrailName=trail['Name'])
+                          for selector in selectors.get('EventSelectors', []):
+                              if (selector.get('IncludeManagementEvents', False) and 
+                                  selector.get('ReadWriteType') in ['All', 'WriteOnly']):
+                                  print(f"Found suitable CloudTrail: {trail['Name']}")
+                                  return trail['Name']
+                      except Exception as e:
+                          print(f"Could not check trail {trail['Name']}: {str(e)}")
+                          continue
+              except Exception as e:
+                  print(f"Error checking CloudTrails: {str(e)}")
+              return None
+          
+          def create_cloudtrail_infrastructure(s3, cloudtrail, bucket_name, trail_name, account_id):
+              # Create S3 bucket if it doesn't exist
+              if not check_bucket_exists(s3, bucket_name):
+                  print(f"Creating S3 bucket: {bucket_name}")
+                  try:
+                      s3.create_bucket(Bucket=bucket_name)
+                      
+                      # Set bucket versioning
+                      s3.put_bucket_versioning(
+                          Bucket=bucket_name,
+                          VersioningConfiguration={'Status': 'Enabled'}
+                      )
+                      
+                      # Set public access block
+                      s3.put_public_access_block(
+                          Bucket=bucket_name,
+                          PublicAccessBlockConfiguration={
+                              'BlockPublicAcls': True,
+                              'IgnorePublicAcls': True,
+                              'BlockPublicPolicy': True,
+                              'RestrictPublicBuckets': True
+                          }
+                      )
+                      print(f"S3 bucket {bucket_name} created and configured")
+                  except Exception as e:
+                      if "BucketAlreadyExists" not in str(e):
+                          raise
+                      print(f"Bucket {bucket_name} already exists, continuing...")
+              
+              # Set bucket policy
+              bucket_policy = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": "AWSCloudTrailAclCheck",
+                          "Effect": "Allow",
+                          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                          "Action": "s3:GetBucketAcl",
+                          "Resource": f"arn:aws:s3:::{bucket_name}",
+                          "Condition": {
+                              "StringEquals": {
+                                  "aws:SourceArn": f"arn:aws:cloudtrail:us-east-1:{account_id}:trail/{trail_name}"
+                              }
+                          }
+                      },
+                      {
+                          "Sid": "AWSCloudTrailWrite",
+                          "Effect": "Allow",
+                          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                          "Action": "s3:PutObject",
+                          "Resource": f"arn:aws:s3:::{bucket_name}/AWSLogs/{account_id}/*",
+                          "Condition": {
+                              "StringEquals": {
+                                  "s3:x-amz-acl": "bucket-owner-full-control",
+                                  "aws:SourceArn": f"arn:aws:cloudtrail:us-east-1:{account_id}:trail/{trail_name}"
+                              }
+                          }
+                      }
+                  ]
+              }
+              
+              s3.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(bucket_policy))
+              print(f"Bucket policy set for {bucket_name}")
+              
+              # Create CloudTrail
+              print(f"Creating CloudTrail: {trail_name}")
+              cloudtrail.create_trail(
+                  Name=trail_name,
+                  S3BucketName=bucket_name,
+                  IsMultiRegionTrail=True,
+                  IncludeGlobalServiceEvents=True
+              )
+              
+              # Set event selectors
+              cloudtrail.put_event_selectors(
+                  TrailName=trail_name,
+                  EventSelectors=[{
+                      'ReadWriteType': 'All',
+                      'IncludeManagementEvents': True
+                  }]
+              )
+              
+              # Start logging
+              cloudtrail.start_logging(Name=trail_name)
+              print(f"CloudTrail {trail_name} created and started")
+              
+              # Wait a moment for propagation
+              time.sleep(5)
+
+  # Custom resource to manage CloudTrail infrastructure intelligently
+  CloudTrailManager:
+    Type: Custom::CloudTrailManager
+    Properties:
+      ServiceToken: !GetAtt CloudTrailManagerFunction.Arn
+      Mode: !Ref CreateCloudTrail
+
+  # FIXED: Improved EventBridge Rule for CreateAccountResult events
+  CreateAccountResultRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture CreateAccountResult events and move accounts to Normal OU
+      EventPattern:
+        detail:
+          eventSource:
+            - organizations.amazonaws.com
+          eventName:
+            - CreateAccountResult
+          serviceEventDetails:
+            createAccountStatus:
+              state:
+                - SUCCEEDED
+      State: ENABLED
+      Targets:
+        - Id: SendToAccountMoverLambda
+          Arn: !GetAtt AccountMoverFunction.Arn
+
+  # FIXED: Improved EventBridge Rule for AcceptHandshake events with better filtering
+  AcceptHandshakeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture AcceptHandshake events and move accounts to Normal OU
+      EventPattern:
+        detail:
+          eventSource:
+            - organizations.amazonaws.com
+          eventName:
+            - AcceptHandshake
+          responseElements:
+            handshake:
+              state:
+                - ACCEPTED
+              action:
+                - INVITE
+      State: ENABLED
+      Targets:
+        - Id: SendToAccountMoverLambda
+          Arn: !GetAtt AccountMoverFunction.Arn
+
+  # IAM Role for Lambda
+  AccountMoverLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AccountMoverLambdaRole-Fixed
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAccountMoverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:MoveAccount
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccountsForParent
+                  - organizations:DescribeAccount
+                  - organizations:DescribeOrganizationalUnit
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # FIXED: Lambda Function with improved account ID extraction and parent detection
+  AccountMoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AccountAutoMover-Fixed
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt AccountMoverLambdaRole.Arn
+      Environment:
+        Variables:
+          NORMAL_OU_ID: !Ref NormalOUId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def handler(event, context):
+              try:
+                  print(f"🔍 Received event: {json.dumps(event, default=str)}")
+                  
+                  # Get the detail from the event
+                  event_detail = event.get("detail", {})
+                  event_name = event_detail.get("eventName")
+                  
+                  organizations = boto3.client('organizations')
+                  normal_ou_id = os.environ['NORMAL_OU_ID']
+                  
+                  print(f"🎯 Target Normal OU ID: {normal_ou_id}")
+                  
+                  account_id = None
+                  account_name = "Unknown"
+                  
+                  # FIXED: Improved account ID extraction
+                  if event_name == "CreateAccountResult":
+                      service_event_details = event_detail.get("serviceEventDetails", {})
+                      create_account_status = service_event_details.get("createAccountStatus", {})
+                      account_id = create_account_status.get("accountId")
+                      account_name = create_account_status.get("accountName", "Unknown")
+                      print(f"📝 CreateAccountResult event - New account: {account_name} ({account_id})")
+                      
+                  elif event_name == "AcceptHandshake":
+                      # FIXED: Correct account ID extraction from AcceptHandshake event
+                      response_elements = event_detail.get("responseElements", {})
+                      handshake = response_elements.get("handshake", {})
+                      parties = handshake.get("parties", [])
+                      
+                      print(f"🤝 AcceptHandshake event - analyzing handshake parties...")
+                      print(f"🔍 Handshake details: action={handshake.get('action')}, state={handshake.get('state')}")
+                      
+                      # Find the account party (the invited account)
+                      for party in parties:
+                          party_type = party.get("type")  # FIXED: Use lowercase key
+                          party_id = party.get("id")      # FIXED: Use lowercase key
+                          print(f"📋 Party: Type={party_type}, Id={party_id}")
+                          
+                          if party_type == "ACCOUNT":
+                              # Skip the master account (inviter) - use recipientAccountId for AcceptHandshake events
+                              master_account_id = event_detail.get("recipientAccountId")
+                              if party_id != master_account_id:
+                                  account_id = party_id
+                                  account_name = f"InvitedAccount-{account_id}"
+                                  print(f"✅ Found invited account: {account_id}")
+                                  break
+                      
+                      if not account_id:
+                          print("❌ Could not find invited account ID in AcceptHandshake event")
+                          return {"status": "error", "message": "Invited account ID not found"}
+                  
+                  if not account_id:
+                      print("❌ Could not extract account ID from event")
+                      return {"status": "error", "message": "Could not extract account ID"}
+                  
+                  print(f"🎯 Processing account: {account_name} ({account_id})")
+                  
+                  # FIXED: Improved parent detection with better error handling
+                  current_parent = find_account_current_parent(organizations, account_id, normal_ou_id)
+                  
+                  if current_parent == normal_ou_id:
+                      print(f"✅ Account {account_id} is already in Normal OU")
+                      return {"status": "success", "message": f"Account {account_id} already in Normal OU"}
+                  elif current_parent is None:
+                      print(f"❌ Could not determine current parent for account {account_id}")
+                      return {"status": "error", "message": f"Could not find account {account_id} in organization"}
+                  
+                  print(f"📍 Account {account_id} current parent: {current_parent}")
+                  
+                  # Move account to Normal OU
+                  try:
+                      print(f"🚀 Moving account {account_id} from {current_parent} to Normal OU {normal_ou_id}")
+                      
+                      organizations.move_account(
+                          AccountId=account_id,
+                          SourceParentId=current_parent,
+                          DestinationParentId=normal_ou_id
+                      )
+                      
+                      print(f"✅ Successfully moved account {account_id} to Normal OU")
+                      
+                      # Verify the move
+                      try:
+                          accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
+                          moved_successfully = any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts'])
+                          
+                          if moved_successfully:
+                              print(f"✅ Verified: Account {account_id} is now in Normal OU")
+                              return {"status": "success", "message": f"Account {account_id} moved to Normal OU successfully"}
+                          else:
+                              print(f"⚠️ Move command succeeded but verification failed for account {account_id}")
+                              return {"status": "warning", "message": f"Move succeeded but verification failed"}
+                              
+                      except Exception as verify_error:
+                          print(f"⚠️ Could not verify move: {str(verify_error)}")
+                          return {"status": "warning", "message": f"Move succeeded but could not verify"}
+                          
+                  except Exception as move_error:
+                      error_msg = str(move_error)
+                      print(f"❌ Failed to move account {account_id}: {error_msg}")
+                      
+                      if "InvalidParameterException" in error_msg:
+                          print("❌ Invalid parameter - check if Normal OU ID is correct")
+                      elif "AccessDeniedException" in error_msg:
+                          print("❌ Access denied - check IAM permissions")
+                      elif "AccountNotFoundException" in error_msg:
+                          print("❌ Account not found in organization")
+                      elif "DuplicateAccountException" in error_msg:
+                          print("❌ Account already in target OU")
+                      
+                      return {"status": "error", "message": f"Failed to move account: {error_msg}"}
+              
+              except Exception as e:
+                  error_msg = str(e)
+                  print(f"❌ Unexpected error: {error_msg}")
+                  return {"status": "error", "message": f"Unexpected error: {error_msg}"}
+          
+          def find_account_current_parent(organizations, account_id, normal_ou_id):
+              """
+              FIXED: More robust function to find account's current parent
+              Returns the parent ID or None if not found
+              """
+              try:
+                  # Get root ID
+                  roots = organizations.list_roots()
+                  root_id = roots['Roots'][0]['Id']
+                  print(f"🏠 Organization Root ID: {root_id}")
+                  
+                  # Check if account is in root
+                  try:
+                      accounts_in_root = organizations.list_accounts_for_parent(ParentId=root_id)
+                      if any(acc['Id'] == account_id for acc in accounts_in_root['Accounts']):
+                          print(f"📍 Account {account_id} found in Root")
+                          return root_id
+                  except Exception as e:
+                      print(f"⚠️ Error checking root: {str(e)}")
+                  
+                  # Check if account is already in normal OU
+                  try:
+                      accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
+                      if any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts']):
+                          print(f"📍 Account {account_id} found in Normal OU")
+                          return normal_ou_id
+                  except Exception as e:
+                      print(f"⚠️ Error checking normal OU: {str(e)}")
+                  
+                  # If not found in root or normal OU, search all OUs recursively
+                  print(f"🔍 Account not found in root or normal OU, searching all OUs...")
+                  all_ous = []
+                  
+                  def collect_ous(parent_id):
+                      try:
+                          ous = organizations.list_organizational_units_for_parent(ParentId=parent_id)
+                          for ou in ous['OrganizationalUnits']:
+                              all_ous.append(ou['Id'])
+                              collect_ous(ou['Id'])  # Recursive search
+                      except Exception as e:
+                          print(f"⚠️ Error collecting OUs for parent {parent_id}: {str(e)}")
+                  
+                  collect_ous(root_id)
+                  
+                  # Check each OU
+                  for ou_id in all_ous:
+                      try:
+                          accounts_in_ou = organizations.list_accounts_for_parent(ParentId=ou_id)
+                          if any(acc['Id'] == account_id for acc in accounts_in_ou['Accounts']):
+                              print(f"📍 Account {account_id} found in OU: {ou_id}")
+                              return ou_id
+                      except Exception as e:
+                          print(f"⚠️ Error checking OU {ou_id}: {str(e)}")
+                          continue
+                  
+                  print(f"❌ Account {account_id} not found in any OU")
+                  return None
+                  
+              except Exception as e:
+                  print(f"❌ Error in find_account_current_parent: {str(e)}")
+                  return None
+
+  # Lambda permissions for EventBridge
+  LambdaPermissionForCreateAccountRule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AccountMoverFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CreateAccountResultRule.Arn
+
+  LambdaPermissionForAcceptHandshakeRule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AccountMoverFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AcceptHandshakeRule.Arn
+
+Outputs:
+  CloudTrailBucketName:
+    Description: "S3 bucket name for CloudTrail logs"
+    Value: !GetAtt CloudTrailManager.BucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailBucket"
+
+  CloudTrailStatus:
+    Description: "CloudTrail configuration status"
+    Value: !GetAtt CloudTrailManager.Status
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailStatus"
+
+  CloudTrailName:
+    Description: "Name of the CloudTrail being used"
+    Value: !GetAtt CloudTrailManager.CloudTrailName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailName"
+
+  CloudTrailManagementResult:
+    Description: "CloudTrail infrastructure management results"
+    Value: !Sub |
+      Status: ${CloudTrailManager.Status}
+      BucketExists: ${CloudTrailManager.BucketExists}  
+      SuitableCloudTrailExists: ${CloudTrailManager.SuitableCloudTrailExists}
+      CloudTrailCreated: ${CloudTrailManager.CloudTrailCreated}
+      CloudTrailName: ${CloudTrailManager.CloudTrailName}
+      Reason: ${CloudTrailManager.Reason}
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailManagement"
+
+  AccountMoverFunctionArn:
+    Description: "ARN of the account mover Lambda function"
+    Value: !GetAtt AccountMoverFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountMoverArn"
+
+  NormalOUId:
+    Description: "ID of the Normal OU where accounts are moved"
+    Value: !Ref NormalOUId
+    Export:
+      Name: !Sub "${AWS::StackName}-NormalOUId"
