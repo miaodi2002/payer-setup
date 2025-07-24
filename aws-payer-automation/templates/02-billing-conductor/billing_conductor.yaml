@@ -46,7 +46,7 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 900  # 15分钟，账户创建可能需要较长时间
+      Timeout: 1200  # 20分钟，包括账户创建时间(最多15分钟) + CB family集成等待时间(3分钟) + 其他操作缓冲时间
       Code:
         ZipFile: |
           import json
@@ -104,16 +104,40 @@ Resources:
                       # 6. 等待账户创建完成
                       new_account_id = wait_for_account_creation(organizations, request_id)
                       print(f"New account created: {new_account_id}")
+                      
+                      # 7. 等待3分钟让账户加入Consolidated Billing family
+                      print("Waiting 3 minutes for the account to join the CB family...")
+                      wait_for_cb_family_integration(180)  # 3分钟 = 180秒
+                      print("Wait completed. Account should now be available for BillingConductor operations.")
 
-                  # 7. 创建或查找BillingGroup
+                  # 8. 创建或查找BillingGroup
                   billing_group_arn = create_or_find_billing_group(billingconductor, new_account_id)
                   print(f"BillingGroup ready: {billing_group_arn}")
+                  
+                  # 9. 获取最终的BillingGroup信息用于响应
+                  try:
+                      final_group_info = billingconductor.get_billing_group(Arn=billing_group_arn)
+                      final_group_name = final_group_info.get('Name', 'Unknown')
+                      print(f"📋 Final BillingGroup Summary:")
+                      print(f"   Name: {final_group_name}")
+                      print(f"   ARN: {billing_group_arn}")
+                      print(f"   Primary Account: {new_account_id}")
+                      
+                      # 记录名称不匹配的情况（这是AWS的正常行为）
+                      if final_group_name.lower() != 'bills':
+                          print(f"ℹ️  AWS assigned name '{final_group_name}' (expected AWS behavior)")
+                      
+                      success_message = f"Account and BillingGroup created successfully. BillingGroup name: {final_group_name}"
+                      
+                  except Exception as info_error:
+                      print(f"⚠️  Could not retrieve final BillingGroup info: {str(info_error)}")
+                      success_message = "Account and BillingGroup created successfully"
 
                   response_data = {
                       "NewAccountId": new_account_id,
                       "NewAccountEmail": new_account_email,
                       "BillingGroupArn": billing_group_arn,
-                      "Message": "Account and BillingGroup created successfully"
+                      "Message": success_message
                   }
 
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
@@ -252,10 +276,32 @@ Resources:
               
               raise Exception("Account creation timeout after 30 minutes")
 
+          def wait_for_cb_family_integration(wait_seconds):
+              """等待账户加入Consolidated Billing family"""
+              print(f"Starting CB family integration wait: {wait_seconds} seconds")
+              
+              # 将等待时间分成12个5秒间隔，每15秒打印一次状态
+              intervals = wait_seconds // 15  # 每15秒一个间隔
+              remaining_wait = wait_seconds % 15
+              
+              for i in range(intervals):
+                  elapsed = i * 15
+                  remaining = wait_seconds - elapsed
+                  print(f"CB family integration wait: {elapsed}s elapsed, {remaining}s remaining...")
+                  time.sleep(15)
+              
+              # 处理剩余的等待时间
+              if remaining_wait > 0:
+                  elapsed = intervals * 15
+                  print(f"CB family integration wait: {elapsed}s elapsed, {remaining_wait}s remaining...")
+                  time.sleep(remaining_wait)
+              
+              print(f"CB family integration wait completed: {wait_seconds} seconds total")
+
           def create_or_find_billing_group(billingconductor, primary_account_id):
-              """创建或查找现有的BillingGroup"""
+              """查找现有BillingGroup或创建新的，确保新创建的使用'Bills'名称"""
               try:
-                  # 首先检查是否已存在Bills BillingGroup
+                  # 检查是否已存在BillingGroups
                   print(f"Checking for existing BillingGroups for account {primary_account_id}")
                   
                   existing_groups = billingconductor.list_billing_groups()
@@ -263,22 +309,19 @@ Resources:
                   for group in existing_groups.get('BillingGroups', []):
                       group_name = group.get('Name', '')
                       group_primary_account = group.get('PrimaryAccountId', '')
+                      group_arn = group.get('Arn', '')
                       
                       print(f"Found BillingGroup: {group_name} (Primary: {group_primary_account})")
                       
-                      # 检查是否是我们要找的Bills组，且Primary Account匹配
-                      if (group_name.lower() == 'bills' and group_primary_account == primary_account_id):
-                          print(f"Found existing Bills BillingGroup: {group['Arn']}")
-                          return group['Arn']
-                      
-                      # 检查是否Primary Account相同但名称不同（可能需要更新）
+                      # 如果找到相同Primary Account的BillingGroup，直接使用
                       if group_primary_account == primary_account_id:
-                          print(f"Found BillingGroup with same Primary Account but different name: {group_name}")
-                          print(f"Using existing BillingGroup: {group['Arn']}")
-                          return group['Arn']
+                          print(f"✅ Found existing BillingGroup for this account: {group_name}")
+                          print(f"ℹ️  Using existing BillingGroup: {group_arn}")
+                          return group_arn
                   
                   # 如果没有找到现有的BillingGroup，创建新的
-                  print(f"No existing BillingGroup found for account {primary_account_id}. Creating new one.")
+                  print(f"🎯 No existing BillingGroup found for account {primary_account_id}")
+                  print(f"🎯 Creating new BillingGroup with name 'Bills'")
                   return create_billing_group(billingconductor, primary_account_id)
                   
               except Exception as e:
@@ -342,38 +385,86 @@ Resources:
                           standard_plan_arn = f"arn:aws:billingconductor::{account_id}:pricingplan/{random_id}"
                           print(f"Using fallback ARN: {standard_plan_arn}")
                   
-                  # 创建 BillingGroup（ComputationPreference 是必需的）
-                  print(f"Creating BillingGroup with pricing plan: {standard_plan_arn}")
-                  response = billingconductor.create_billing_group(
-                      Name='Bills',
-                      Description='Billing group for customer original pricing',
-                      PrimaryAccountId=primary_account_id,
-                      AccountGrouping={
+                  # 创建 BillingGroup，强制使用'Bills'名称
+                  billing_group_name = 'Bills'
+                  print(f"🎯 Creating BillingGroup with name '{billing_group_name}' and pricing plan: {standard_plan_arn}")
+                  
+                  create_params = {
+                      'Name': billing_group_name,
+                      'Description': f'Billing group for customer original pricing - Account {primary_account_id}',
+                      'PrimaryAccountId': primary_account_id,
+                      'AccountGrouping': {
                           'LinkedAccountIds': [primary_account_id]
                       },
-                      ComputationPreference={
+                      'ComputationPreference': {
                           'PricingPlanArn': standard_plan_arn
                       }
-                  )
+                  }
                   
-                  print(f"BillingGroup created successfully: {response['Arn']}")
-                  return response['Arn']
+                  print(f"📋 Create parameters: Name='{create_params['Name']}'")
+                  response = billingconductor.create_billing_group(**create_params)
+                  
+                  created_arn = response['Arn']
+                  print(f"✅ BillingGroup created successfully: {created_arn}")
+                  
+                  # 验证创建的BillingGroup名称
+                  try:
+                      group_info = billingconductor.get_billing_group(Arn=created_arn)
+                      actual_name = group_info.get('Name', 'Unknown')
+                      print(f"📋 BillingGroup verification:")
+                      print(f"   Requested name: '{billing_group_name}'")
+                      print(f"   Actual name: '{actual_name}'")
+                      print(f"   ARN: {created_arn}")
+                      
+                      if actual_name.lower() == billing_group_name.lower():
+                          print(f"✅ SUCCESS: BillingGroup name is correctly set to '{actual_name}'")
+                      else:
+                          print(f"❌ ERROR: AWS assigned name '{actual_name}' instead of requested '{billing_group_name}'")
+                          # 如果名称不匹配，这可能是一个严重的问题
+                          raise Exception(f"BillingGroup name mismatch: expected '{billing_group_name}', got '{actual_name}'")
+                      
+                  except Exception as verify_error:
+                      print(f"⚠️  Could not verify BillingGroup name: {str(verify_error)}")
+                      raise verify_error
+                  
+                  return created_arn
                   
               except Exception as e:
                   print(f"BillingGroup creation error: {str(e)}")
                   # 如果还是失败，尝试最简单的创建方式
                   try:
-                      print("Attempting simple BillingGroup creation without pricing plan specifics")
+                      billing_group_name = 'Bills'
+                      print(f"🎯 Attempting simple BillingGroup creation with name '{billing_group_name}'")
                       response = billingconductor.create_billing_group(
-                          Name='Bills',
-                          Description='Billing group for customer original pricing',
+                          Name=billing_group_name,
+                          Description=f'Billing group for customer original pricing - Account {primary_account_id}',
                           PrimaryAccountId=primary_account_id,
                           AccountGrouping={
                               'LinkedAccountIds': [primary_account_id]
                           },
                           ComputationPreference={}  # 空的 ComputationPreference
                       )
-                      return response['Arn']
+                      
+                      fallback_arn = response['Arn']
+                      print(f"✅ Fallback BillingGroup created: {fallback_arn}")
+                      
+                      # 验证fallback创建的名称
+                      try:
+                          group_info = billingconductor.get_billing_group(Arn=fallback_arn)
+                          actual_name = group_info.get('Name', 'Unknown')
+                          print(f"📋 Fallback BillingGroup verification:")
+                          print(f"   Requested name: '{billing_group_name}'")
+                          print(f"   Actual name: '{actual_name}'")
+                          
+                          if actual_name.lower() == billing_group_name.lower():
+                              print(f"✅ SUCCESS: Fallback BillingGroup name correctly set to '{actual_name}'")
+                          else:
+                              print(f"⚠️  Fallback BillingGroup got name '{actual_name}' instead of '{billing_group_name}'")
+                              
+                      except Exception as verify_error:
+                          print(f"⚠️  Could not verify fallback BillingGroup name: {str(verify_error)}")
+                      
+                      return fallback_arn
                   except Exception as simple_error:
                       print(f"Simple creation also failed: {str(simple_error)}")
                       raise e
