@@ -114,9 +114,11 @@ Resources:
 
                   print(f"Setting up Athena for Account: {account_id}")
 
-                  # 1. 创建Glue Database
-                  database_name = f"athenacurcfn_{account_id}"
-                  create_glue_database(glue, database_name, account_id)
+                  # 1. 创建两个Glue Database
+                  proforma_database_name = f"athenacurcfn_{account_id}"
+                  risp_database_name = f"athenacurcfn_risp_{account_id}"
+                  create_glue_database(glue, proforma_database_name, account_id, "Pro forma CUR data")
+                  create_glue_database(glue, risp_database_name, account_id, "RISP CUR data")
 
                   # 2. 创建IAM角色
                   crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
@@ -126,17 +128,17 @@ Resources:
                   # 3. 创建Lambda函数（Crawler初始化器）
                   initializer_function_arn = create_crawler_initializer(lambda_client, lambda_role_arn, account_id)
 
-                  # 4. 创建Glue Crawlers
+                  # 4. 创建Glue Crawlers，分别指向不同的数据库
                   proforma_crawler_name = f"AWSCURCrawler-{account_id}"
                   risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
                   
-                  create_glue_crawler(glue, proforma_crawler_name, database_name, crawler_role_arn, 
+                  create_glue_crawler(glue, proforma_crawler_name, proforma_database_name, crawler_role_arn, 
                                     proforma_bucket, proforma_report)
-                  create_glue_crawler(glue, risp_crawler_name, database_name, crawler_role_arn, 
+                  create_glue_crawler(glue, risp_crawler_name, risp_database_name, crawler_role_arn, 
                                     risp_bucket, risp_report)
 
-                  # 5. 创建状态表
-                  create_status_tables(glue, database_name, account_id, proforma_bucket, risp_bucket, 
+                  # 5. 创建状态表，分别在两个数据库中
+                  create_status_tables(glue, proforma_database_name, risp_database_name, account_id, proforma_bucket, risp_bucket, 
                                       proforma_report, risp_report)
 
                   # 6. 设置S3通知
@@ -149,10 +151,11 @@ Resources:
                   start_initial_crawl(glue, proforma_crawler_name, risp_crawler_name)
 
                   response_data = {
-                      "DatabaseName": database_name,
+                      "ProformaDatabaseName": proforma_database_name,
+                      "RISPDatabaseName": risp_database_name,
                       "ProformaCrawlerName": proforma_crawler_name,
                       "RISPCrawlerName": risp_crawler_name,
-                      "Message": "Athena environment created successfully"
+                      "Message": "Athena environment with two databases created successfully"
                   }
 
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
@@ -161,7 +164,7 @@ Resources:
                   print(f"Error: {str(e)}")
                   cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
 
-          def create_glue_database(glue, database_name, account_id):
+          def create_glue_database(glue, database_name, account_id, data_type):
               """创建Glue Database"""
               try:
                   # 检查database是否已存在
@@ -176,10 +179,10 @@ Resources:
                   glue.create_database(
                       DatabaseInput={
                           'Name': database_name,
-                          'Description': f'Database for CUR data analysis - Account {account_id}'
+                          'Description': f'Database for {data_type} analysis - Account {account_id}'
                       }
                   )
-                  print(f"Created database: {database_name}")
+                  print(f"Created database: {database_name} for {data_type}")
 
               except Exception as e:
                   print(f"Database creation error: {str(e)}")
@@ -464,18 +467,18 @@ Resources:
                   print(f"Crawler creation error for {crawler_name}: {str(e)}")
                   raise
 
-          def create_status_tables(glue, database_name, account_id, proforma_bucket, risp_bucket, proforma_report, risp_report):
-              """创建CUR状态跟踪表"""
+          def create_status_tables(glue, proforma_database_name, risp_database_name, account_id, proforma_bucket, risp_bucket, proforma_report, risp_report):
+              """创建CUR状态跟踪表，分别在两个数据库中"""
               try:
-                  # Pro forma状态表
+                  # Pro forma状态表 - 在Pro forma数据库中
                   proforma_table_name = "cost_and_usage_data_status"
-                  create_status_table(glue, database_name, proforma_table_name, proforma_bucket, proforma_report)
+                  create_status_table(glue, proforma_database_name, proforma_table_name, proforma_bucket, proforma_report)
 
-                  # RISP状态表
-                  risp_table_name = "risp_cost_and_usage_data_status"
-                  create_status_table(glue, database_name, risp_table_name, risp_bucket, risp_report)
+                  # RISP状态表 - 在RISP数据库中
+                  risp_table_name = "cost_and_usage_data_status"
+                  create_status_table(glue, risp_database_name, risp_table_name, risp_bucket, risp_report)
 
-                  print("Created status tracking tables")
+                  print("Created status tracking tables in separate databases")
 
               except Exception as e:
                   print(f"Status table creation error: {str(e)}")
@@ -663,11 +666,17 @@ Resources:
       RISPReportName: !Ref RISPReportName
 
 Outputs:
-  DatabaseName:
-    Description: "Glue database name for CUR data"
-    Value: !GetAtt CreateAthenaEnvironment.DatabaseName
+  ProformaDatabaseName:
+    Description: "Glue database name for Pro forma CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaDatabaseName
     Export:
-      Name: !Sub "${AWS::StackName}-DatabaseName"
+      Name: !Sub "${AWS::StackName}-ProformaDatabaseName"
+
+  RISPDatabaseName:
+    Description: "Glue database name for RISP CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.RISPDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPDatabaseName"
 
   ProformaCrawlerName:
     Description: "Pro forma CUR crawler name"

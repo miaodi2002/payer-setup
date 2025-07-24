@@ -9,7 +9,7 @@
 
 **功能**: 设置统一的Athena环境管理CUR数据
 **创建资源**:
-- 统一的Glue Database管理CUR数据表
+- 两个独立的Glue Database分别管理Pro forma和RISP CUR数据表
 - Pro forma和RISP CUR的Glue Crawler
 - Lambda函数处理自动化数据发现
 - S3事件通知自动触发数据更新
@@ -106,12 +106,14 @@ export MODULE5_STACK_NAME="${STACK_PREFIX}-athena-setup-${TIMESTAMP}"
 
 # Athena相关变量
 export MASTER_ACCOUNT_ID=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
-export EXPECTED_DATABASE_NAME="athenacurcfn_${MASTER_ACCOUNT_ID}"
+export EXPECTED_PROFORMA_DATABASE_NAME="athenacurcfn_${MASTER_ACCOUNT_ID}"
+export EXPECTED_RISP_DATABASE_NAME="athenacurcfn_risp_${MASTER_ACCOUNT_ID}"
 
 # 验证变量
 echo "=== 模组5环境变量 ==="
 echo "Stack Name: $MODULE5_STACK_NAME"
-echo "Database Name: $EXPECTED_DATABASE_NAME"
+echo "Pro forma Database Name: $EXPECTED_PROFORMA_DATABASE_NAME"
+echo "RISP Database Name: $EXPECTED_RISP_DATABASE_NAME"
 echo "Pro forma Bucket: $PROFORMA_BUCKET_NAME"
 echo "RISP Bucket: $RISP_BUCKET_NAME"
 echo "Pro forma Report: $PROFORMA_REPORT_NAME"
@@ -222,10 +224,16 @@ done
 echo "=== 获取部署输出 ===" | tee -a $LOG_FILE
 
 # 获取栈输出
-export ATHENA_DATABASE_NAME=$(aws cloudformation describe-stacks \
+export PROFORMA_DATABASE_NAME=$(aws cloudformation describe-stacks \
   --stack-name $MODULE5_STACK_NAME \
   --region $REGION \
-  --query 'Stacks[0].Outputs[?OutputKey==`DatabaseName`].OutputValue' \
+  --query 'Stacks[0].Outputs[?OutputKey==`ProformaDatabaseName`].OutputValue' \
+  --output text)
+
+export RISP_DATABASE_NAME=$(aws cloudformation describe-stacks \
+  --stack-name $MODULE5_STACK_NAME \
+  --region $REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`RISPDatabaseName`].OutputValue' \
   --output text)
 
 export PROFORMA_CRAWLER_NAME=$(aws cloudformation describe-stacks \
@@ -240,7 +248,8 @@ export RISP_CRAWLER_NAME=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`RISPCrawlerName`].OutputValue' \
   --output text)
 
-echo "Athena数据库名称: $ATHENA_DATABASE_NAME" | tee -a $LOG_FILE
+echo "Pro forma数据库名称: $PROFORMA_DATABASE_NAME" | tee -a $LOG_FILE
+echo "RISP数据库名称: $RISP_DATABASE_NAME" | tee -a $LOG_FILE
 echo "Pro forma Crawler名称: $PROFORMA_CRAWLER_NAME" | tee -a $LOG_FILE
 echo "RISP Crawler名称: $RISP_CRAWLER_NAME" | tee -a $LOG_FILE
 ```
@@ -251,23 +260,68 @@ echo "RISP Crawler名称: $RISP_CRAWLER_NAME" | tee -a $LOG_FILE
 ```bash
 echo "=== 验证Glue数据库创建 ===" | tee -a $LOG_FILE
 
-# 检查数据库是否存在
-DATABASE_EXISTS=$(aws glue get-database --name $ATHENA_DATABASE_NAME --region $REGION 2>/dev/null || echo "ERROR")
+# 检查Pro forma数据库是否存在
+echo "--- Pro forma数据库验证 ---" | tee -a $LOG_FILE
+PROFORMA_DB_EXISTS=$(aws glue get-database --name $PROFORMA_DATABASE_NAME --region $REGION 2>/dev/null || echo "ERROR")
 
-if [ "$DATABASE_EXISTS" != "ERROR" ]; then
-  echo "✅ Glue数据库创建成功: $ATHENA_DATABASE_NAME" | tee -a $LOG_FILE
-  aws glue get-database --name $ATHENA_DATABASE_NAME --region $REGION \
+if [ "$PROFORMA_DB_EXISTS" != "ERROR" ]; then
+  echo "✅ Pro forma数据库创建成功: $PROFORMA_DATABASE_NAME" | tee -a $LOG_FILE
+  aws glue get-database --name $PROFORMA_DATABASE_NAME --region $REGION \
     --query 'Database.{Name:Name,Description:Description}' \
     --output table | tee -a $LOG_FILE
 else
-  echo "❌ Glue数据库不存在: $ATHENA_DATABASE_NAME" | tee -a $LOG_FILE
+  echo "❌ Pro forma数据库不存在: $PROFORMA_DATABASE_NAME" | tee -a $LOG_FILE
 fi
 
-# 列出数据库中的表
-echo "--- 数据库中的表 ---" | tee -a $LOG_FILE
-aws glue get-tables --database-name $ATHENA_DATABASE_NAME --region $REGION \
-  --query 'TableList[].{Name:Name,StorageDescriptor:StorageDescriptor.Location}' \
+# 检查RISP数据库是否存在
+echo "--- RISP数据库验证 ---" | tee -a $LOG_FILE
+RISP_DB_EXISTS=$(aws glue get-database --name $RISP_DATABASE_NAME --region $REGION 2>/dev/null || echo "ERROR")
+
+if [ "$RISP_DB_EXISTS" != "ERROR" ]; then
+  echo "✅ RISP数据库创建成功: $RISP_DATABASE_NAME" | tee -a $LOG_FILE
+  aws glue get-database --name $RISP_DATABASE_NAME --region $REGION \
+    --query 'Database.{Name:Name,Description:Description}' \
+    --output table | tee -a $LOG_FILE
+else
+  echo "❌ RISP数据库不存在: $RISP_DATABASE_NAME" | tee -a $LOG_FILE
+fi
+
+# 验证数据分离正确性（重要！）
+echo "--- 数据分离验证 ---" | tee -a $LOG_FILE
+echo "⚠️  重要：验证数据是否正确分离到各自数据库" | tee -a $LOG_FILE
+
+# 检查Pro forma数据库中的表
+echo "Pro forma数据库表（应仅包含Pro forma相关表）:" | tee -a $LOG_FILE
+PROFORMA_TABLES=$(aws glue get-tables --database-name $PROFORMA_DATABASE_NAME --region $REGION \
+  --query 'TableList[].{Name:Name,Location:StorageDescriptor.Location}' \
+  --output table 2>/dev/null | tee -a $LOG_FILE)
+
+# 检查是否有错误的RISP表在Pro forma数据库中
+RISP_IN_PROFORMA=$(aws glue get-tables --database-name $PROFORMA_DATABASE_NAME --region $REGION \
+  --query 'TableList[?contains(Name, `risp`)].Name' --output text 2>/dev/null)
+
+if [ -n "$RISP_IN_PROFORMA" ] && [ "$RISP_IN_PROFORMA" != "None" ]; then
+  echo "❌ 错误：Pro forma数据库包含RISP表: $RISP_IN_PROFORMA" | tee -a $LOG_FILE
+  echo "🔧 需要手动清理：aws glue delete-table --database-name $PROFORMA_DATABASE_NAME --name [RISP表名]" | tee -a $LOG_FILE
+else
+  echo "✅ Pro forma数据库数据分离正确" | tee -a $LOG_FILE
+fi
+
+# 检查RISP数据库中的表
+echo "--- RISP数据库中的表 ---" | tee -a $LOG_FILE
+aws glue get-tables --database-name $RISP_DATABASE_NAME --region $REGION \
+  --query 'TableList[].{Name:Name,Location:StorageDescriptor.Location}' \
   --output table | tee -a $LOG_FILE
+
+# 验证RISP表位置正确性
+PROFORMA_IN_RISP=$(aws glue get-tables --database-name $RISP_DATABASE_NAME --region $REGION \
+  --query 'TableList[?contains(Location, `bip-cur-`) && !contains(Location, `risp`)].Name' --output text 2>/dev/null)
+
+if [ -n "$PROFORMA_IN_RISP" ] && [ "$PROFORMA_IN_RISP" != "None" ]; then
+  echo "❌ 错误：RISP数据库包含Pro forma数据路径的表: $PROFORMA_IN_RISP" | tee -a $LOG_FILE
+else
+  echo "✅ RISP数据库数据分离正确" | tee -a $LOG_FILE
+fi
 ```
 
 ### 2. 验证Glue Crawler创建
@@ -413,16 +467,21 @@ fi
 完成以下所有检查项表示模组5测试成功：
 
 ### Glue数据库检查
-- [ ] Athena数据库创建成功并可访问
-- [ ] 数据库名称正确（包含账户ID）
-- [ ] 数据库可用于Athena查询
+- [ ] Pro forma数据库创建成功并可访问 (athenacurcfn_{account_id})
+- [ ] RISP数据库创建成功并可访问 (athenacurcfn_risp_{account_id})
+- [ ] 两个数据库名称正确（包含账户ID）
+- [ ] 两个数据库可用于Athena查询
+- [ ] **数据分离正确性验证** ⚠️ **关键检查**
+  - [ ] Pro forma数据库不包含RISP表
+  - [ ] RISP数据库不包含Pro forma表
+  - [ ] 表的S3路径与数据库类型匹配
 
 ### Glue Crawler检查
 - [ ] Pro forma Crawler创建成功并配置正确
 - [ ] RISP Crawler创建成功并配置正确
-- [ ] Crawler指向正确的S3存储桶
-- [ ] Crawler使用正确的数据库
-- [ ] Crawler状态为READY或RUNNING
+- [ ] Pro forma Crawler指向正确的S3存储桶和数据库
+- [ ] RISP Crawler指向正确的S3存储桶和数据库
+- [ ] 两个Crawler状态为READY或RUNNING
 
 ### Lambda函数检查
 - [ ] 环境创建Lambda函数执行成功
@@ -440,7 +499,26 @@ fi
 
 ## 故障排除
 
-### 常见问题1: Glue数据库创建失败
+### 常见问题1: 数据分离错误
+**症状**: Pro forma数据库包含RISP表，或RISP数据库包含Pro forma表
+**原因**: Crawler历史配置导致数据写入错误数据库
+**解决方案**:
+```bash
+# 检查数据分离状态
+echo "检查Pro forma数据库中是否有RISP表:"
+aws glue get-tables --database-name $PROFORMA_DATABASE_NAME --region $REGION \
+  --query 'TableList[?contains(Name, `risp`)].{Name:Name,Location:StorageDescriptor.Location}' \
+  --output table
+
+# 如发现错误表，手动删除
+aws glue delete-table --database-name $PROFORMA_DATABASE_NAME --name [错误的RISP表名] --region $REGION
+
+# 重新启动对应Crawler
+aws glue start-crawler --name $PROFORMA_CRAWLER_NAME --region $REGION
+aws glue start-crawler --name $RISP_CRAWLER_NAME --region $REGION
+```
+
+### 常见问题2: Glue数据库创建失败
 **症状**: 数据库创建失败或无法访问
 **解决方案**:
 ```bash
@@ -502,15 +580,18 @@ source /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
 echo "开始清理模组5资源..." | tee -a $LOG_FILE
 
 # 删除Glue表（如果存在）
-if [ -n "$ATHENA_DATABASE_NAME" ]; then
-  TABLES=$(aws glue get-tables --database-name $ATHENA_DATABASE_NAME --region $REGION \
-    --query 'TableList[].Name' --output text 2>/dev/null)
-  
-  for TABLE in $TABLES; do
-    echo "删除表: $TABLE" | tee -a $LOG_FILE
-    aws glue delete-table --database-name $ATHENA_DATABASE_NAME --name $TABLE --region $REGION
-  done
-fi
+for DATABASE in "$PROFORMA_DATABASE_NAME" "$RISP_DATABASE_NAME"; do
+  if [ -n "$DATABASE" ]; then
+    echo "删除数据库中的表: $DATABASE" | tee -a $LOG_FILE
+    TABLES=$(aws glue get-tables --database-name $DATABASE --region $REGION \
+      --query 'TableList[].Name' --output text 2>/dev/null)
+    
+    for TABLE in $TABLES; do
+      echo "删除表: $TABLE" | tee -a $LOG_FILE
+      aws glue delete-table --database-name $DATABASE --name $TABLE --region $REGION
+    done
+  fi
+done
 
 # 删除CloudFormation栈
 aws cloudformation delete-stack \
@@ -536,7 +617,8 @@ echo "✅ 模组5资源清理完成" | tee -a $LOG_FILE
 
 ```bash
 # 保存关键变量供参考
-echo "export ATHENA_DATABASE_NAME='$ATHENA_DATABASE_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
+echo "export PROFORMA_DATABASE_NAME='$PROFORMA_DATABASE_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
+echo "export RISP_DATABASE_NAME='$RISP_DATABASE_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
 echo "export PROFORMA_CRAWLER_NAME='$PROFORMA_CRAWLER_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
 echo "export RISP_CRAWLER_NAME='$RISP_CRAWLER_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
 echo "export MODULE5_STACK_NAME='$MODULE5_STACK_NAME'" >> /Users/di.miao/Work/payer-setup/deployment-testing/test-variables.sh
@@ -552,14 +634,14 @@ cat << 'EOF' | tee -a $LOG_FILE
 
 -- 查看Pro forma CUR数据
 SELECT line_item_product_code, SUM(line_item_blended_cost) as total_cost 
-FROM "${ATHENA_DATABASE_NAME}"."${PROFORMA_REPORT_NAME}" 
+FROM "${PROFORMA_DATABASE_NAME}"."${PROFORMA_REPORT_NAME}" 
 WHERE year='2024' AND month='01' 
 GROUP BY line_item_product_code 
 ORDER BY total_cost DESC LIMIT 10;
 
 -- 查看RISP CUR数据
 SELECT line_item_product_code, SUM(line_item_unblended_cost) as total_cost 
-FROM "${ATHENA_DATABASE_NAME}"."${RISP_REPORT_NAME}" 
+FROM "${RISP_DATABASE_NAME}"."${RISP_REPORT_NAME}" 
 WHERE year='2024' AND month='01' 
 GROUP BY line_item_product_code 
 ORDER BY total_cost DESC LIMIT 10;
