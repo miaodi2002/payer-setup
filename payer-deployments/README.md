@@ -6,6 +6,10 @@ payer-deployments/
 ├── README.md                          # 此文件：系统说明
 ├── PRODUCTION-DEPLOYMENT-GUIDE.md     # 生产环境部署标准流程
 ├── CLAUDE-CODE-DEPLOYMENT-GUIDE.md    # Claude Code AI辅助部署指南
+├── VERSION-MANAGEMENT-GUIDE.md        # 🆕 版本管理系统指南
+├── TROUBLESHOOTING-GUIDE.md           # 🆕 故障排除指南
+├── VERSION-MANAGEMENT-IMPLEMENTATION-SUMMARY.md # 🆕 版本管理实施总结
+├── DOCUMENTATION-UPDATE-SUMMARY.md    # 🆕 文档更新总结
 ├── config/                            # 配置文件
 │   ├── payer-registry.json            # Payer注册表
 │   ├── deployment-config.json         # 部署配置模板
@@ -16,8 +20,8 @@ payer-deployments/
 │   ├── progress-report.md             # 进度报告模板
 │   └── checklist.md                  # 检查清单模板
 ├── scripts/                           # 自动化脚本
-│   ├── pre-deployment-check.sh        # 部署前环境检查 (新)
-│   ├── start-deployment.sh            # 标准化部署启动向导 (新)
+│   ├── pre-deployment-check.sh        # 部署前环境检查
+│   ├── start-deployment.sh            # 标准化部署启动向导
 │   ├── deploy-payer.sh               # 单个Payer部署脚本
 │   ├── monitor-deployment.sh         # 部署监控脚本
 │   ├── generate-report.sh            # 报告生成脚本
@@ -32,14 +36,54 @@ payer-deployments/
         ├── progress-report.md        # 进度报告
         ├── issues.md                # 问题记录
         └── completion-summary.md     # 完成总结
+
+../aws-payer-automation/templates/    # 🆕 版本化模板目录
+├── versions/                         # 版本管理
+│   ├── v0/                          # 原始版本（deprecated）
+│   └── v1/                          # 稳定版本（Elite-new11验证）
+├── current/                         # 符号链接指向推荐版本
+├── version-registry.json           # 版本注册表
+└── deployment-scripts/              # 版本管理脚本
+    └── version-management.sh        # 版本管理CLI工具
 ```
 
 ## 核心功能
 1. **统一的Payer管理**: 记录所有Payer信息和状态
 2. **标准化部署流程**: 使用模板确保一致性
-3. **实时进度跟踪**: 自动化监控和报告生成
-4. **问题追踪和解决**: 集中记录和解决方案
-5. **历史记录和审计**: 完整的部署历史
+3. **🆕 版本管理系统**: 模板版本控制，避免已知问题 
+4. **实时进度跟踪**: 自动化监控和报告生成
+5. **问题追踪和解决**: 集中记录和解决方案
+6. **历史记录和审计**: 完整的部署历史
+
+## 🔄 版本管理系统 (2025-07-24新增)
+
+基于Elite-new11部署经验建立的版本管理系统，解决关键部署问题：
+
+### 🎯 核心优势
+- **稳定可靠**: v1版本经过Elite-new11生产验证，100%避免已知问题
+- **向后兼容**: 现有脚本自动使用稳定版本，无需修改
+- **智能管理**: 版本管理CLI工具提供完整的版本控制功能
+- **问题预防**: Module 5和6的关键问题已在v1版本中修复
+
+### 🚀 快速开始
+```bash
+# 推荐：使用版本管理脚本
+cd ../aws-payer-automation
+./deployment-scripts/version-management.sh deploy-all v1 <payer-name>
+
+# 传统方式：自动使用v1稳定版本
+./scripts/deploy-payer.sh <payer-name>
+
+# 查看版本信息
+./deployment-scripts/version-management.sh list-versions
+```
+
+### 📋 版本状态
+| 版本 | 状态 | 描述 | 推荐 |
+|------|------|------|------|
+| v0 | deprecated | 原始版本，存在已知问题 | ❌ |
+| v1 | stable | Elite-new11验证，所有问题已修复 | ✅ |
+| current | symlink | 自动指向推荐稳定版本 | ✅ |
 
 ## 详细使用方法
 
@@ -59,10 +103,27 @@ payer-deployments/
 ```
 
 ### 2. 部署Payer
+
+#### 🌟 推荐方式：版本管理脚本
+```bash
+cd ../aws-payer-automation
+
+# 完整部署（推荐）
+./deployment-scripts/version-management.sh deploy-all v1 payer-001
+
+# 部署特定模块
+./deployment-scripts/version-management.sh deploy 05-athena-setup v1 stack-name
+
+# 查看版本信息
+./deployment-scripts/version-management.sh list-versions
+./deployment-scripts/version-management.sh version-info v1
+```
+
+#### 🔄 传统方式：自动使用v1版本
 ```bash
 cd payer-deployments
 
-# 完整部署
+# 完整部署（现在自动使用v1稳定版本）
 ./scripts/deploy-payer.sh payer-001
 
 # 模拟运行（测试）
@@ -174,14 +235,16 @@ cd payer-deployments
 部署要求:
 - Payer名称: <payer-name>
 - 账户类型: [新账户/现有账户]
+- 模板版本: v1 (推荐，Elite-new11验证通过)
 - 特殊要求: [如有任何特殊配置需求]
 
 请按照以下步骤执行:
 1. 运行环境检查脚本
-2. 生成标准化部署命令
-3. 逐个执行所有模块的部署
-4. 在每个模块完成后进行验证
-5. 记录部署日志和进度
+2. 使用v1稳定版本模板
+3. 生成标准化部署命令（优先使用版本管理脚本）
+4. 逐个执行所有模块的部署
+5. 在每个模块完成后进行验证
+6. 记录部署日志和进度
 
 如果遇到任何错误,请停下来告诉我并提供解决方案。
 ```
@@ -271,31 +334,49 @@ Claude Code在接到部署请求后会自动执行以下工作流程:
 # 让Claude Code检查环境
 请运行 ./scripts/pre-deployment-check.sh 并告诉我结果
 
-# 让Claude Code开始部署
-请为 <payer-name> 运行标准化部署流程
+# 让Claude Code使用版本管理系统开始部署
+请为 <payer-name> 使用v1版本运行标准化部署流程，优先使用版本管理脚本
+
+# 让Claude Code检查版本信息
+请运行版本管理脚本查看可用版本：./deployment-scripts/version-management.sh list-versions
 
 # 让Claude Code检查栈状态  
 请检查所有CloudFormation栈的当前状态
 
-# 让Claude Code修复问题
+# 让Claude Code修复问题（现在问题更少了）
 <payer-name> 的Module X部署失败,错误是: [错误信息], 请帮助修复
 
 # 让Claude Code生成报告
 请为 <payer-name> 生成完整的部署状态报告
+
+# 让Claude Code验证版本管理系统
+请验证版本管理系统是否正常工作，包括符号链接和模板完整性
 ```
 
 ### 📚 详细指南文档
 
+- **[VERSION-MANAGEMENT-GUIDE.md](./VERSION-MANAGEMENT-GUIDE.md)** 🆕: 版本管理系统完整指南
+  - 版本管理脚本使用方法
+  - 版本对照表和修复说明
+  - 推荐部署流程
+  - 版本生命周期管理
+
 - **[CLAUDE-CODE-DEPLOYMENT-GUIDE.md](./CLAUDE-CODE-DEPLOYMENT-GUIDE.md)**: Claude Code AI辅助部署完整指南
-  - 详细的提示模板
+  - 详细的提示模板（已更新版本管理集成）
   - 高级交互命令
   - 错误处理策略
   - 最佳实践建议
 
 - **[PRODUCTION-DEPLOYMENT-GUIDE.md](./PRODUCTION-DEPLOYMENT-GUIDE.md)**: 生产环境标准部署流程
-  - 手动部署步骤
+  - 手动部署步骤（已更新使用v1版本）
   - 环境验证清单
-  - 故障排除指南
+  - Elite-new11修复经验
+
+- **[TROUBLESHOOTING-GUIDE.md](./TROUBLESHOOTING-GUIDE.md)** 🆕: 故障排除指南
+  - 基于Elite-new11经验的问题解决方案
+  - 常见错误分类和修复方法
+  - 高级诊断技巧
+  - 紧急修复流程
 
 ## 估算信息
 - **单个Payer部署时间**: 2-3小时
