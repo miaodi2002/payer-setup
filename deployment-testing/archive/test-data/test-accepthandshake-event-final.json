@@ -1,0 +1,62 @@
+{
+  "version": "0",
+  "id": "test-final-event",
+  "detail-type": "AWS API Call via CloudTrail",
+  "source": "aws.organizations",
+  "account": "730335480018",
+  "time": "2025-07-23T06:18:12Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "eventVersion": "1.09",
+    "userIdentity": {
+      "type": "AWSAccount",
+      "principalId": "050451385285",
+      "accountId": "050451385285"
+    },
+    "eventTime": "2025-07-23T06:18:12Z",
+    "eventSource": "organizations.amazonaws.com",
+    "eventName": "AcceptHandshake",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "221.113.120.75",
+    "requestParameters": {
+      "handshakeId": "h-44b78c8a7310407a8c122efe1731c55e"
+    },
+    "responseElements": {
+      "handshake": {
+        "id": "h-44b78c8a7310407a8c122efe1731c55e",
+        "arn": "arn:aws:organizations::730335480018:handshake/o-t4quxjx4cr/invite/h-44b78c8a7310407a8c122efe1731c55e",
+        "parties": [
+          {
+            "id": "050451385285",
+            "type": "ACCOUNT"
+          },
+          {
+            "id": "t4quxjx4cr",
+            "type": "ORGANIZATION"
+          }
+        ],
+        "state": "ACCEPTED",
+        "requestedTimestamp": "Jul 23, 2025, 6:18:03 AM",
+        "expirationTimestamp": "Aug 7, 2025, 6:18:03 AM",
+        "action": "INVITE",
+        "resources": [
+          {
+            "value": "o-t4quxjx4cr",
+            "type": "ORGANIZATION"
+          },
+          {
+            "value": "050451385285",
+            "type": "ACCOUNT"
+          }
+        ]
+      }
+    },
+    "requestID": "27afcf46-14bc-4923-9e98-41152df7f237",
+    "eventID": "f6552793-7f80-47cb-bc47-97ca97ada406",
+    "readOnly": false,
+    "eventType": "AwsApiCall",
+    "managementEvent": true,
+    "recipientAccountId": "730335480018"
+  }
+}

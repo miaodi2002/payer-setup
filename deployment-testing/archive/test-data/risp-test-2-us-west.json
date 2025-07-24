@@ -1,0 +1,13 @@
+{
+    "ReportName": "risp-test-2-uswest",
+    "TimeUnit": "DAILY", 
+    "Format": "Parquet",
+    "Compression": "Parquet",
+    "AdditionalSchemaElements": ["RESOURCES"],
+    "S3Bucket": "bip-risp-cur-730335480018",
+    "S3Prefix": "test2/daily",
+    "S3Region": "us-west-2",
+    "AdditionalArtifacts": ["ATHENA"],
+    "RefreshClosedReports": true,
+    "ReportVersioning": "OVERWRITE_REPORT"
+}
