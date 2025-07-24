@@ -1,0 +1,36 @@
+{
+  "deployment_settings": {
+    "region": "us-east-1",
+    "stack_prefix": "payer",
+    "timeout_minutes": 60,
+    "retry_attempts": 2,
+    "parallel_limit": 3,
+    "backup_enabled": true
+  },
+  "module_dependencies": {
+    "01-ou-scp": [],
+    "02-billing-conductor": ["01-ou-scp"],
+    "03-cur-proforma": ["02-billing-conductor"],
+    "04-cur-risp": ["02-billing-conductor"],
+    "05-athena-setup": ["03-cur-proforma", "04-cur-risp"],
+    "06-account-auto-management": ["02-billing-conductor"],
+    "07-cloudfront-monitoring": ["02-billing-conductor"]
+  },
+  "notification_settings": {
+    "email_enabled": false,
+    "slack_enabled": false,
+    "log_level": "INFO"
+  },
+  "validation_checks": {
+    "pre_deployment": [
+      "aws_credentials",
+      "template_validation",
+      "dependency_check"
+    ],
+    "post_deployment": [
+      "stack_status",
+      "resource_creation",
+      "data_separation"
+    ]
+  }
+}

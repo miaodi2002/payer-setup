@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-07-24",
+  "payers": {
+    "payer-001": {
+      "name": "Demo Payer 1",
+      "company": "示例公司A",
+      "master_account_email": "admin+payer1@example.com",
+      "contact_person": "张三",
+      "contact_email": "zhangsan@example.com",
+      "deployment_status": "planned",
+      "priority": "high",
+      "created_date": "2025-07-24",
+      "notes": "首批部署，用于验证流程",
+      "modules": {
+        "01-ou-scp": {"status": "pending", "estimated_time": "30min"},
+        "02-billing-conductor": {"status": "pending", "estimated_time": "50min"},
+        "03-cur-proforma": {"status": "pending", "estimated_time": "20min"},
+        "04-cur-risp": {"status": "pending", "estimated_time": "20min"},
+        "05-athena-setup": {"status": "pending", "estimated_time": "30min"},
+        "06-account-auto-management": {"status": "pending", "estimated_time": "25min"},
+        "07-cloudfront-monitoring": {"status": "pending", "estimated_time": "15min"}
+      }
+    },
+    "payer-002": {
+      "name": "Demo Payer 2",
+      "company": "示例公司B",
+      "master_account_email": "admin+payer2@example.com",
+      "contact_person": "李四",
+      "contact_email": "lisi@example.com",
+      "deployment_status": "planned",
+      "priority": "medium",
+      "created_date": "2025-07-24",
+      "notes": "第二批部署",
+      "modules": {
+        "01-ou-scp": {"status": "pending", "estimated_time": "30min"},
+        "02-billing-conductor": {"status": "pending", "estimated_time": "50min"},
+        "03-cur-proforma": {"status": "pending", "estimated_time": "20min"},
+        "04-cur-risp": {"status": "pending", "estimated_time": "20min"},
+        "05-athena-setup": {"status": "pending", "estimated_time": "30min"},
+        "06-account-auto-management": {"status": "pending", "estimated_time": "25min"},
+        "07-cloudfront-monitoring": {"status": "pending", "estimated_time": "15min"}
+      }
+    }
+  },
+  "deployment_statistics": {
+    "total_payers": 2,
+    "completed": 0,
+    "in_progress": 0,
+    "planned": 2,
+    "failed": 0
+  }
+}
