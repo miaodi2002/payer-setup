@@ -22,16 +22,16 @@
         "07-cloudfront-monitoring": {"status": "pending", "estimated_time": "15min"}
       }
     },
-    "payer-002": {
-      "name": "Demo Payer 2",
-      "company": "示例公司B",
-      "master_account_email": "admin+payer2@example.com",
-      "contact_person": "李四",
-      "contact_email": "lisi@example.com",
-      "deployment_status": "planned",
-      "priority": "medium",
+    "Elite-new11": {
+      "name": "Elite-new11",
+      "company": "Elite Corporation",
+      "master_account_email": "admin@elite-corp.com",
+      "contact_person": "系统管理员",
+      "contact_email": "sysadmin@elite-corp.com",
+      "deployment_status": "in_progress",
+      "priority": "high",
       "created_date": "2025-07-24",
-      "notes": "第二批部署",
+      "notes": "实际生产部署 - Elite-new11",
       "modules": {
         "01-ou-scp": {"status": "pending", "estimated_time": "30min"},
         "02-billing-conductor": {"status": "pending", "estimated_time": "50min"},

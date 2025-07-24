@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: "Automatically move new AWS accounts to Normal OU when they join the organization"
+Description: "Automatically move new AWS accounts to Normal OU when they join the organization - FIXED VERSION V2"
 
 Parameters:
   NormalOUId:
@@ -43,7 +43,8 @@ Resources:
                   - s3:ListBucket
                   - s3:PutBucketPolicy
                   - s3:PutBucketVersioning
-                  - s3:PutPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
                   - cloudtrail:CreateTrail
                   - cloudtrail:DeleteTrail
                   - cloudtrail:DescribeTrails
@@ -58,7 +59,10 @@ Resources:
   CloudTrailManagerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-CloudTrailManager"
+      # FIXED: Use shorter function name to avoid 64 character limit
+      FunctionName: !Sub 
+        - "Elite-${ShortName}-CTManager"
+        - ShortName: !Select [1, !Split ["-", !Ref "AWS::StackName"]]
       Runtime: python3.9
       Handler: index.handler
       Role: !GetAtt CloudTrailDetectorRole.Arn
@@ -110,19 +114,21 @@ Resources:
                       response_data["Status"] = "Created"
                   elif mode == "auto":
                       # Auto detection mode
-                      if not bucket_exists and not suitable_trail:
-                          # Create everything
+                      if not suitable_trail:
+                          # If no suitable trail exists, create one (regardless of bucket status)
+                          print(f"No suitable CloudTrail found. Creating new CloudTrail...")
                           create_cloudtrail_infrastructure(s3, cloudtrail, bucket_name, trail_name, account_id)
                           response_data["CloudTrailCreated"] = "true"
                           response_data["CloudTrailName"] = trail_name
-                          response_data["Reason"] = "No infrastructure found - created new CloudTrail"
+                          if bucket_exists:
+                              response_data["Reason"] = "S3 bucket exists but no suitable CloudTrail - created new CloudTrail"
+                          else:
+                              response_data["Reason"] = "No infrastructure found - created new CloudTrail and S3 bucket"
                           response_data["Status"] = "Created"
-                      elif suitable_trail:
+                      else:
+                          # Use existing suitable trail
                           response_data["Reason"] = f"Using existing suitable CloudTrail: {suitable_trail}"
                           response_data["Status"] = "Using Existing"
-                      else:
-                          response_data["Reason"] = "S3 bucket exists but no suitable CloudTrail - using existing bucket"
-                          response_data["Status"] = "Using Existing Bucket"
                   
                   print(f"Final result: {response_data}")
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
@@ -260,7 +266,7 @@ Resources:
       ServiceToken: !GetAtt CloudTrailManagerFunction.Arn
       Mode: !Ref CreateCloudTrail
 
-  # EventBridge Rule for CreateAccountResult events
+  # FIXED: Improved EventBridge Rule for CreateAccountResult events
   CreateAccountResultRule:
     Type: AWS::Events::Rule
     Properties:
@@ -280,7 +286,7 @@ Resources:
         - Id: SendToAccountMoverLambda
           Arn: !GetAtt AccountMoverFunction.Arn
 
-  # EventBridge Rule for AcceptHandshake events  
+  # FIXED: Improved EventBridge Rule for AcceptHandshake events with better filtering
   AcceptHandshakeRule:
     Type: AWS::Events::Rule
     Properties:
@@ -295,6 +301,8 @@ Resources:
             handshake:
               state:
                 - ACCEPTED
+              action:
+                - INVITE
       State: ENABLED
       Targets:
         - Id: SendToAccountMoverLambda
@@ -304,7 +312,7 @@ Resources:
   AccountMoverLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: AccountMoverLambdaRole
+      RoleName: AccountMoverLambdaRole-Fixed
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -332,11 +340,11 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
 
-  # Lambda Function for moving accounts
+  # FIXED: Lambda Function with improved account ID extraction and parent detection
   AccountMoverFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: AccountAutoMover
+      FunctionName: AccountAutoMover-Fixed
       Runtime: python3.9
       Handler: index.handler
       Timeout: 60
@@ -352,7 +360,7 @@ Resources:
           
           def handler(event, context):
               try:
-                  print(f"Received event: {json.dumps(event, default=str)}")
+                  print(f"🔍 Received event: {json.dumps(event, default=str)}")
                   
                   # Get the detail from the event
                   event_detail = event.get("detail", {})
@@ -361,64 +369,68 @@ Resources:
                   organizations = boto3.client('organizations')
                   normal_ou_id = os.environ['NORMAL_OU_ID']
                   
-                  print(f"Target Normal OU ID: {normal_ou_id}")
+                  print(f"🎯 Target Normal OU ID: {normal_ou_id}")
                   
                   account_id = None
-                  parent_account_id = event_detail.get("userIdentity", {}).get("accountId")
+                  account_name = "Unknown"
                   
-                  # Extract account ID based on event type
+                  # FIXED: Improved account ID extraction
                   if event_name == "CreateAccountResult":
                       service_event_details = event_detail.get("serviceEventDetails", {})
                       create_account_status = service_event_details.get("createAccountStatus", {})
                       account_id = create_account_status.get("accountId")
                       account_name = create_account_status.get("accountName", "Unknown")
-                      print(f"CreateAccountResult event - New account: {account_name} ({account_id})")
+                      print(f"📝 CreateAccountResult event - New account: {account_name} ({account_id})")
                       
                   elif event_name == "AcceptHandshake":
-                      # For AcceptHandshake, the account joining is in userIdentity
-                      account_id = parent_account_id
-                      print(f"AcceptHandshake event - Account joining: {account_id}")
+                      # FIXED: Correct account ID extraction from AcceptHandshake event
+                      response_elements = event_detail.get("responseElements", {})
+                      handshake = response_elements.get("handshake", {})
+                      parties = handshake.get("parties", [])
+                      
+                      print(f"🤝 AcceptHandshake event - analyzing handshake parties...")
+                      print(f"🔍 Handshake details: action={handshake.get('action')}, state={handshake.get('state')}")
+                      
+                      # Find the account party (the invited account)
+                      for party in parties:
+                          party_type = party.get("type")  # FIXED: Use lowercase key
+                          party_id = party.get("id")      # FIXED: Use lowercase key
+                          print(f"📋 Party: Type={party_type}, Id={party_id}")
+                          
+                          if party_type == "ACCOUNT":
+                              # Skip the master account (inviter) - use recipientAccountId for AcceptHandshake events
+                              master_account_id = event_detail.get("recipientAccountId")
+                              if party_id != master_account_id:
+                                  account_id = party_id
+                                  account_name = f"InvitedAccount-{account_id}"
+                                  print(f"✅ Found invited account: {account_id}")
+                                  break
+                      
+                      if not account_id:
+                          print("❌ Could not find invited account ID in AcceptHandshake event")
+                          return {"status": "error", "message": "Invited account ID not found"}
                   
                   if not account_id:
                       print("❌ Could not extract account ID from event")
                       return {"status": "error", "message": "Could not extract account ID"}
                   
-                  # Get Root ID to check current parent
-                  roots = organizations.list_roots()
-                  root_id = roots['Roots'][0]['Id']
-                  print(f"Organization Root ID: {root_id}")
+                  print(f"🎯 Processing account: {account_name} ({account_id})")
                   
-                  # Check current parent of the account
-                  try:
-                      accounts_in_root = organizations.list_accounts_for_parent(ParentId=root_id)
-                      account_in_root = any(acc['Id'] == account_id for acc in accounts_in_root['Accounts'])
-                      
-                      if account_in_root:
-                          current_parent = root_id
-                          print(f"Account {account_id} is currently in Root")
-                      else:
-                          # Check if already in Normal OU
-                          try:
-                              accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
-                              account_in_normal = any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts'])
-                              
-                              if account_in_normal:
-                                  print(f"✅ Account {account_id} is already in Normal OU")
-                                  return {"status": "success", "message": f"Account {account_id} already in Normal OU"}
-                              else:
-                                  print(f"⚠️ Account {account_id} not found in Root or Normal OU")
-                                  return {"status": "warning", "message": f"Account {account_id} location unknown"}
-                          except Exception as normal_check_error:
-                              print(f"Error checking Normal OU: {str(normal_check_error)}")
-                              current_parent = root_id  # Assume it's in root
-                              
-                  except Exception as parent_check_error:
-                      print(f"Error checking current parent: {str(parent_check_error)}")
-                      current_parent = root_id  # Default to root
+                  # FIXED: Improved parent detection with better error handling
+                  current_parent = find_account_current_parent(organizations, account_id, normal_ou_id)
+                  
+                  if current_parent == normal_ou_id:
+                      print(f"✅ Account {account_id} is already in Normal OU")
+                      return {"status": "success", "message": f"Account {account_id} already in Normal OU"}
+                  elif current_parent is None:
+                      print(f"❌ Could not determine current parent for account {account_id}")
+                      return {"status": "error", "message": f"Could not find account {account_id} in organization"}
+                  
+                  print(f"📍 Account {account_id} current parent: {current_parent}")
                   
                   # Move account to Normal OU
                   try:
-                      print(f"Moving account {account_id} from {current_parent} to Normal OU {normal_ou_id}")
+                      print(f"🚀 Moving account {account_id} from {current_parent} to Normal OU {normal_ou_id}")
                       
                       organizations.move_account(
                           AccountId=account_id,
@@ -454,6 +466,8 @@ Resources:
                           print("❌ Access denied - check IAM permissions")
                       elif "AccountNotFoundException" in error_msg:
                           print("❌ Account not found in organization")
+                      elif "DuplicateAccountException" in error_msg:
+                          print("❌ Account already in target OU")
                       
                       return {"status": "error", "message": f"Failed to move account: {error_msg}"}
               
@@ -461,6 +475,68 @@ Resources:
                   error_msg = str(e)
                   print(f"❌ Unexpected error: {error_msg}")
                   return {"status": "error", "message": f"Unexpected error: {error_msg}"}
+          
+          def find_account_current_parent(organizations, account_id, normal_ou_id):
+              """
+              FIXED: More robust function to find account's current parent
+              Returns the parent ID or None if not found
+              """
+              try:
+                  # Get root ID
+                  roots = organizations.list_roots()
+                  root_id = roots['Roots'][0]['Id']
+                  print(f"🏠 Organization Root ID: {root_id}")
+                  
+                  # Check if account is in root
+                  try:
+                      accounts_in_root = organizations.list_accounts_for_parent(ParentId=root_id)
+                      if any(acc['Id'] == account_id for acc in accounts_in_root['Accounts']):
+                          print(f"📍 Account {account_id} found in Root")
+                          return root_id
+                  except Exception as e:
+                      print(f"⚠️ Error checking root: {str(e)}")
+                  
+                  # Check if account is already in normal OU
+                  try:
+                      accounts_in_normal = organizations.list_accounts_for_parent(ParentId=normal_ou_id)
+                      if any(acc['Id'] == account_id for acc in accounts_in_normal['Accounts']):
+                          print(f"📍 Account {account_id} found in Normal OU")
+                          return normal_ou_id
+                  except Exception as e:
+                      print(f"⚠️ Error checking normal OU: {str(e)}")
+                  
+                  # If not found in root or normal OU, search all OUs recursively
+                  print(f"🔍 Account not found in root or normal OU, searching all OUs...")
+                  all_ous = []
+                  
+                  def collect_ous(parent_id):
+                      try:
+                          ous = organizations.list_organizational_units_for_parent(ParentId=parent_id)
+                          for ou in ous['OrganizationalUnits']:
+                              all_ous.append(ou['Id'])
+                              collect_ous(ou['Id'])  # Recursive search
+                      except Exception as e:
+                          print(f"⚠️ Error collecting OUs for parent {parent_id}: {str(e)}")
+                  
+                  collect_ous(root_id)
+                  
+                  # Check each OU
+                  for ou_id in all_ous:
+                      try:
+                          accounts_in_ou = organizations.list_accounts_for_parent(ParentId=ou_id)
+                          if any(acc['Id'] == account_id for acc in accounts_in_ou['Accounts']):
+                              print(f"📍 Account {account_id} found in OU: {ou_id}")
+                              return ou_id
+                      except Exception as e:
+                          print(f"⚠️ Error checking OU {ou_id}: {str(e)}")
+                          continue
+                  
+                  print(f"❌ Account {account_id} not found in any OU")
+                  return None
+                  
+              except Exception as e:
+                  print(f"❌ Error in find_account_current_parent: {str(e)}")
+                  return None
 
   # Lambda permissions for EventBridge
   LambdaPermissionForCreateAccountRule:

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: "Automatically move new AWS accounts to Normal OU when they join the organization - FIXED VERSION"
+Description: "Automatically move new AWS accounts to Normal OU when they join the organization - FIXED VERSION V2"
 
 Parameters:
   NormalOUId:
@@ -59,7 +59,10 @@ Resources:
   CloudTrailManagerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-CloudTrailManager"
+      # FIXED: Use shorter function name to avoid 64 character limit
+      FunctionName: !Sub 
+        - "Elite-${ShortName}-CTManager"
+        - ShortName: !Select [1, !Split ["-", !Ref "AWS::StackName"]]
       Runtime: python3.9
       Handler: index.handler
       Role: !GetAtt CloudTrailDetectorRole.Arn

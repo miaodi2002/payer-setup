@@ -186,7 +186,7 @@ mkdir -p "$REPORT_DIR"
                         aws cloudformation deploy \
                             --template-file "$AUTOMATION_DIR/templates/02-billing-conductor/billing_conductor.yaml" \
                             --stack-name "payer-$PAYER_ID-billing-conductor" \
-                            --capabilities CAPABILITY_IAM \
+                            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
                             --region us-east-1 \
                             --parameter-overrides \
                                 PayerId="$PAYER_ID" \
