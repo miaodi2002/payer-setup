@@ -1,0 +1,13 @@
+{
+    "ReportName": "risp-730335480018",
+    "TimeUnit": "DAILY",
+    "Format": "Parquet",
+    "Compression": "Parquet",
+    "AdditionalSchemaElements": ["RESOURCES"],
+    "S3Bucket": "bip-risp-cur-730335480018",
+    "S3Prefix": "daily",
+    "S3Region": "us-east-1",
+    "AdditionalArtifacts": ["ATHENA"],
+    "RefreshClosedReports": true,
+    "ReportVersioning": "OVERWRITE_REPORT"
+}

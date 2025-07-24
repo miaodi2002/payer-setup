@@ -23,7 +23,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: LambdaAthenaSetupRole
+      # RoleName removed - let CloudFormation auto-generate unique name
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -76,7 +76,7 @@ Resources:
   CreateAthenaEnvironmentFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: CreateAthenaEnvironment
+      # FunctionName removed - let CloudFormation auto-generate unique name
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -187,7 +187,7 @@ Resources:
 
           def create_crawler_role(iam, account_id, proforma_bucket, risp_bucket):
               """创建Glue Crawler执行角色"""
-              role_name = f"AWSCURCrawlerRole-{account_id}"
+              role_name = f"AWSCURCrawlerRole-{account_id}-{uuid.uuid4().hex[:8]}"
               
               try:
                   # 检查角色是否已存在
@@ -257,7 +257,7 @@ Resources:
 
           def create_lambda_executor_role(iam):
               """创建Lambda Crawler执行角色"""
-              role_name = "AWSCURCrawlerLambdaExecutor"
+              role_name = f"AWSCURCrawlerLambdaExecutor-{uuid.uuid4().hex[:8]}"
               
               try:
                   # 检查角色是否已存在
@@ -323,7 +323,7 @@ Resources:
 
           def create_s3_lambda_role(iam, proforma_bucket, risp_bucket):
               """创建S3通知Lambda角色"""
-              role_name = "AWSS3CURLambdaExecutor"
+              role_name = f"AWSS3CURLambdaExecutor-{uuid.uuid4().hex[:8]}"
               
               try:
                   # 检查角色是否已存在
@@ -392,7 +392,7 @@ Resources:
 
           def create_crawler_initializer(lambda_client, role_arn, account_id):
               """创建Crawler初始化Lambda函数"""
-              function_name = f"AWSCURInitializer-{account_id}"
+              function_name = f"AWSCURInitializer-{account_id}-{uuid.uuid4().hex[:8]}"
               
               try:
                   # 检查函数是否已存在
@@ -404,37 +404,7 @@ Resources:
                       pass
 
                   # Lambda函数代码
-                  lambda_code = |
-                    import json
-                    import boto3
-
-                    def lambda_handler(event, context):
-                        glue = boto3.client('glue')
-                        
-                        try:
-                            # 从事件中获取爬虫名称
-                            crawler_name = event.get('crawler_name', event.get('CrawlerName'))
-                            
-                            if not crawler_name:
-                                return {
-                                    'statusCode': 400,
-                                    'body': json.dumps('Missing crawler_name parameter')
-                                }
-                            
-                            # 启动爬虫
-                            response = glue.start_crawler(Name=crawler_name)
-                            
-                            return {
-                                'statusCode': 200,
-                                'body': json.dumps(f'Started crawler: {crawler_name}')
-                            }
-                            
-                        except Exception as e:
-                            print(f'Error: {str(e)}')
-                            return {
-                                'statusCode': 500,
-                                'body': json.dumps(f'Error starting crawler: {str(e)}')
-                            }
+                  lambda_code = "import json\nimport boto3\n\ndef lambda_handler(event, context):\n    glue = boto3.client('glue')\n    try:\n        crawler_name = event.get('crawler_name', event.get('CrawlerName'))\n        if not crawler_name:\n            return {'statusCode': 400, 'body': json.dumps('Missing crawler_name parameter')}\n        response = glue.start_crawler(Name=crawler_name)\n        return {'statusCode': 200, 'body': json.dumps(f'Started crawler: {crawler_name}')}\n    except Exception as e:\n        print(f'Error: {str(e)}')\n        return {'statusCode': 500, 'body': json.dumps(f'Error starting crawler: {str(e)}')}\n"
 
                   # 创建函数
                   response = lambda_client.create_function(
@@ -442,7 +412,7 @@ Resources:
                       Runtime='python3.9',
                       Role=role_arn,
                       Handler='index.lambda_handler',
-                      Code={'ZipFile': lambda_code.encode('utf-8')},
+                      Code={'ZipFile': lambda_code},
                       Description=f'Crawler initializer for CUR data - Account {account_id}',
                       Timeout=60
                   )
@@ -560,7 +530,7 @@ Resources:
 
           def create_s3_notification_function(lambda_client, role_arn, initializer_function_arn):
               """创建S3通知处理Lambda函数"""
-              function_name = "AWSS3CURNotification"
+              function_name = f"AWSS3CURNotification-{uuid.uuid4().hex[:8]}"
               
               try:
                   # 检查函数是否已存在
@@ -572,45 +542,7 @@ Resources:
                       pass
 
                   # Lambda函数代码
-                  lambda_code = |
-                    import json
-                    import boto3
-                    import urllib.parse
-
-                    def lambda_handler(event, context):
-                        lambda_client = boto3.client('lambda')
-                        
-                        try:
-                            for record in event['Records']:
-                                # 解析S3事件
-                                bucket = record['s3']['bucket']['name']
-                                key = urllib.parse.unquote_plus(record['s3']['object']['key'], encoding='utf-8')
-                                
-                                # 判断是Pro forma还是RISP CUR
-                                if 'bip-cur-' in bucket and not 'risp' in bucket:
-                                    # Pro forma CUR
-                                    crawler_name = key.split('/')[1].split('-')[0]  # 提取account ID
-                                    crawler_name = f"AWSCURCrawler-{crawler_name}"
-                                elif 'bip-risp-cur-' in bucket:
-                                    # RISP CUR
-                                    crawler_name = key.split('/')[1].split('-')[1]  # 提取account ID
-                                    crawler_name = f"AWSRISPCURCrawler-{crawler_name}"
-                                else:
-                                    continue
-                                
-                                # 调用初始化器启动爬虫
-                                lambda_client.invoke(
-                                    FunctionName='PLACEHOLDER_FUNCTION_ARN',
-                                    InvocationType='Event',
-                                    Payload=json.dumps({'crawler_name': crawler_name})
-                                )
-                                
-                            return {'statusCode': 200, 'body': json.dumps('Processed S3 notifications')}
-                            
-                        except Exception as e:
-                            print(f'Error: {str(e)}')
-                            return {'statusCode': 500, 'body': json.dumps(f'Error: {str(e)}')}
-                  
+                  lambda_code = "import json\nimport boto3\nimport urllib.parse\n\ndef lambda_handler(event, context):\n    lambda_client = boto3.client('lambda')\n    try:\n        for record in event['Records']:\n            bucket = record['s3']['bucket']['name']\n            key = urllib.parse.unquote_plus(record['s3']['object']['key'], encoding='utf-8')\n            if 'bip-cur-' in bucket and not 'risp' in bucket:\n                crawler_name = key.split('/')[1].split('-')[0]\n                crawler_name = f'AWSCURCrawler-{crawler_name}'\n            elif 'bip-risp-cur-' in bucket:\n                crawler_name = key.split('/')[1].split('-')[1]\n                crawler_name = f'AWSRISPCURCrawler-{crawler_name}'\n            else:\n                continue\n            lambda_client.invoke(FunctionName='PLACEHOLDER_FUNCTION_ARN', InvocationType='Event', Payload=json.dumps({'crawler_name': crawler_name}))\n        return {'statusCode': 200, 'body': json.dumps('Processed S3 notifications')}\n    except Exception as e:\n        print(f'Error: {str(e)}')\n        return {'statusCode': 500, 'body': json.dumps(f'Error: {str(e)}')}\n"
                   # 替换placeholder
                   lambda_code = lambda_code.replace('PLACEHOLDER_FUNCTION_ARN', initializer_function_arn)
 
@@ -620,7 +552,7 @@ Resources:
                       Runtime='python3.9',
                       Role=role_arn,
                       Handler='index.lambda_handler',
-                      Code={'ZipFile': lambda_code.encode('utf-8')},
+                      Code={'ZipFile': lambda_code},
                       Description='S3 notification handler for CUR data updates',
                       Timeout=60
                   )

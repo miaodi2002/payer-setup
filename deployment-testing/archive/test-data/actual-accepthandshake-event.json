@@ -1,0 +1,49 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AWSAccount",
+    "principalId": "050451385285",
+    "accountId": "050451385285"
+  },
+  "eventTime": "2025-07-23T02:57:10Z",
+  "eventSource": "organizations.amazonaws.com",
+  "eventName": "AcceptHandshake",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "221.113.122.47",
+  "responseElements": {
+    "handshake": {
+      "id": "h-d6af587d2bb14f43a21e80297843e084",
+      "arn": "arn:aws:organizations::730335480018:handshake/o-t4quxjx4cr/invite/h-d6af587d2bb14f43a21e80297843e084",
+      "parties": [
+        {
+          "id": "050451385285",
+          "type": "ACCOUNT"
+        },
+        {
+          "id": "t4quxjx4cr",
+          "type": "ORGANIZATION"
+        }
+      ],
+      "state": "ACCEPTED",
+      "requestedTimestamp": "Jul 23, 2025, 2:57:02 AM",
+      "expirationTimestamp": "Aug 7, 2025, 2:57:02 AM",
+      "action": "INVITE",
+      "resources": [
+        {
+          "value": "o-t4quxjx4cr",
+          "type": "ORGANIZATION"
+        },
+        {
+          "value": "050451385285",
+          "type": "ACCOUNT"
+        }
+      ]
+    }
+  },
+  "requestID": "16dec179-fc93-4e40-802f-e5f83b557d68",
+  "eventID": "84c883e0-6a6a-46fd-aae7-b6f8bc467fe1",
+  "readOnly": false,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "730335480018"
+}
