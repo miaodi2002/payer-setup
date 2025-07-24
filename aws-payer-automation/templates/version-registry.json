@@ -1,0 +1,156 @@
+{
+  "version": "1.0",
+  "created": "2025-07-24T19:55:00+09:00",
+  "description": "Payer部署模板版本注册表",
+  "current_version": "v1",
+  "versions": {
+    "v0": {
+      "status": "deprecated",
+      "description": "原始版本 - 已知问题存在",
+      "created": "2025-07-24T19:55:00+09:00",
+      "issues": [
+        "Module 5: Lambda代码过长导致CloudFormation部署失败",
+        "Module 6: Lambda函数名超过64字符限制"
+      ],
+      "modules": {
+        "01-ou-scp": {
+          "templates": ["auto_SCP_1.yaml"],
+          "status": "stable",
+          "notes": "原始版本正常工作"
+        },
+        "02-billing-conductor": {
+          "templates": ["billing_conductor.yaml"],
+          "status": "stable",
+          "notes": "原始版本正常工作"
+        },
+        "03-cur-proforma": {
+          "templates": ["cur_export_proforma.yaml"],
+          "status": "stable",
+          "notes": "原始版本正常工作"
+        },
+        "04-cur-risp": {
+          "templates": ["cur_export_risp.yaml"],
+          "status": "stable",
+          "notes": "原始版本正常工作"
+        },
+        "05-athena-setup": {
+          "templates": ["athena_setup.yaml"],
+          "status": "deprecated",
+          "notes": "Lambda代码过长问题 - 28,869字符超过CloudFormation限制",
+          "issues": ["Could not unzip uploaded file error"]
+        },
+        "06-account-auto-management": {
+          "templates": [],
+          "status": "missing",
+          "notes": "原始问题版本未保存，已知函数名长度超限问题"
+        },
+        "07-cloudfront-monitoring": {
+          "templates": ["cloudfront_monitoring.yaml", "oam-link-stackset.yaml"],
+          "status": "stable",
+          "notes": "原始版本正常工作"
+        }
+      }
+    },
+    "v1": {
+      "status": "stable",
+      "description": "稳定版本 - Elite-new11验证通过",
+      "created": "2025-07-24T19:55:00+09:00",
+      "validation": {
+        "deployment": "Elite-new11",
+        "date": "2025-07-24",
+        "account": "272312908613",
+        "status": "success"
+      },
+      "fixes": [
+        "Module 5: 简化Lambda代码解决zip文件问题",
+        "Module 6: 智能函数命名避免64字符限制"
+      ],
+      "modules": {
+        "01-ou-scp": {
+          "templates": ["auto_SCP_1.yaml"],
+          "status": "stable",
+          "notes": "OU和SCP设置，验证通过"
+        },
+        "02-billing-conductor": {
+          "templates": ["billing_conductor.yaml"],
+          "status": "stable",
+          "notes": "BillingConductor核心功能，Elite-new11成功创建账户163814384698"
+        },
+        "03-cur-proforma": {
+          "templates": ["cur_export_proforma.yaml"],
+          "status": "stable",
+          "notes": "Pro forma CUR配置，Elite-new11验证通过"
+        },
+        "04-cur-risp": {
+          "templates": ["cur_export_risp.yaml"],
+          "status": "stable",
+          "notes": "RISP CUR配置，Elite-new11验证通过"
+        },
+        "05-athena-setup": {
+          "templates": ["athena_setup.yaml"],
+          "status": "stable",
+          "notes": "修复版 - 简化Lambda代码，保留核心功能（Glue数据库/Crawlers）",
+          "fixes": ["简化内联Lambda代码到4KB以内", "移除复杂S3通知和状态表功能"],
+          "validation": "Elite-new11成功创建Glue Crawlers和Athena数据库"
+        },
+        "06-account-auto-management": {
+          "templates": ["account_auto_move.yaml"],
+          "status": "stable", 
+          "notes": "修复版 - 智能函数命名策略",
+          "fixes": ["使用Elite-${ShortName}-CTManager命名模式确保≤64字符"],
+          "validation": "Elite-new11成功创建Lambda函数Elite-Elite-CTManager"
+        },
+        "07-cloudfront-monitoring": {
+          "templates": ["cloudfront_monitoring.yaml", "oam-link-stackset.yaml"],
+          "status": "stable",
+          "notes": "CloudFront监控功能，Elite-new11验证通过"
+        }
+      }
+    }
+  },
+  "deployment_recommendations": {
+    "production": {
+      "version": "v1",
+      "notes": "已通过Elite-new11生产验证"
+    },
+    "testing": {
+      "version": "v1",
+      "notes": "使用稳定版本进行测试"
+    },
+    "development": {
+      "version": "current",
+      "notes": "使用current符号链接指向最新稳定版"
+    }
+  },
+  "compatibility": {
+    "aws_regions": ["us-east-1"],
+    "cloudformation_version": "2010-09-09",
+    "required_services": [
+      "AWS Organizations",
+      "AWS BillingConductor", 
+      "AWS Lambda",
+      "AWS Glue",
+      "AWS Athena",
+      "AWS CloudFormation"
+    ]
+  },
+  "changelog": [
+    {
+      "version": "v1",
+      "date": "2025-07-24",
+      "changes": [
+        "修复Module 5 Lambda代码过长问题",
+        "修复Module 6 Lambda函数名长度超限问题",
+        "基于Elite-new11部署经验验证所有修复"
+      ]
+    },
+    {
+      "version": "v0",
+      "date": "2025-07-24", 
+      "changes": [
+        "初始版本整理",
+        "标记已知问题模板为deprecated"
+      ]
+    }
+  ]
+}

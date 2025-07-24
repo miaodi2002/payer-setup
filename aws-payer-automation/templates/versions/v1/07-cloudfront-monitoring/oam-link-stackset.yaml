@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "OAM Link template for member accounts - deployed via StackSet from Payer account"
+
+Parameters:
+  OAMSinkArn:
+    Type: String
+    Description: "ARN of the OAM Sink in the Payer account"
+  PayerName:
+    Type: String
+    Description: "Name of the Payer (used for naming resources)"
+
+Resources:
+  # OAM Link to send CloudFront metrics to Payer account
+  CloudFrontOAMLink:
+    Type: AWS::Oam::Link
+    Properties:
+      LabelTemplate: !Sub "${PayerName}-member-${AWS::AccountId}"
+      LinkConfiguration:
+        MetricConfiguration:
+          Filter: |
+            {
+              "Namespace": "AWS/CloudFront"
+            }
+      ResourceTypes:
+        - "AWS::CloudWatch::Metric"
+      SinkIdentifier: !Ref OAMSinkArn
+      Tags:
+        - Key: Name
+          Value: !Sub "${PayerName}-CloudFront-OAM-Link"
+        - Key: Purpose
+          Value: "CloudFront monitoring for cost control"
+        - Key: PayerName
+          Value: !Ref PayerName
+        - Key: ManagedBy
+          Value: "AWS Payer Automation"
+
+Outputs:
+  OAMLinkArn:
+    Description: "ARN of the created OAM Link"
+    Value: !GetAtt CloudFrontOAMLink.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OAMLinkArn"
+  
+  AccountId:
+    Description: "Account ID where this OAM Link is deployed"
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountId"
+      
+  LinkLabel:
+    Description: "Label of the OAM Link"
+    Value: !GetAtt CloudFrontOAMLink.Label
+    Export:
+      Name: !Sub "${AWS::StackName}-LinkLabel"

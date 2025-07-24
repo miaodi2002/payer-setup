@@ -1,0 +1,15 @@
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 开始部署 Payer: Elite-new11
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 日志文件: /Users/di.miao/Work/payer-setup/payer-deployments/logs/Elite-new11/20250724_153715/deployment.log
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 模拟运行: false
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 指定模块: 02-billing-conductor
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 公司名称: Elite Corporation
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 联系邮箱: admin@elite-corp.com
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 开始部署模块: 02-billing-conductor
+[0;34m[INFO][0m 2025-07-24 15:37:15 - 部署BillingConductor...
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+
+Failed to create/update the stack. Run the following command
+to fetch the list of events leading up to the failure
+aws cloudformation describe-stack-events --stack-name payer-Elite-new11-billing-conductor

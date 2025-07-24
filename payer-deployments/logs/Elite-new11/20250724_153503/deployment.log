@@ -1,0 +1,13 @@
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 开始部署 Payer: Elite-new11
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 日志文件: /Users/di.miao/Work/payer-setup/payer-deployments/logs/Elite-new11/20250724_153503/deployment.log
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 模拟运行: false
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 公司名称: Elite Corporation
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 联系邮箱: admin@elite-corp.com
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 开始部署模块: 01-ou-scp
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 部署OU和SCP设置...
+[1;33m[WARNING][0m 2025-07-24 15:35:03 - OU/SCP模板不存在，跳过
+[0;32m[SUCCESS][0m 2025-07-24 15:35:03 - 模块 01-ou-scp 部署完成，用时: 0秒
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 开始部署模块: 02-billing-conductor
+[0;34m[INFO][0m 2025-07-24 15:35:03 - 部署BillingConductor...
+
+An error occurred (InsufficientCapabilitiesException) when calling the CreateChangeSet operation: Requires capabilities : [CAPABILITY_NAMED_IAM]
