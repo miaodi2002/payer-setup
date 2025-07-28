@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Setup Athena environment with automated Crawler scheduling for CUR data analysis"
+
+Parameters:
+  ProformaBucketName:
+    Type: String
+    Description: "S3 bucket name for Pro forma CUR data"
+  
+  RISPBucketName:
+    Type: String
+    Description: "S3 bucket name for RISP CUR data"
+    
+  ProformaReportName:
+    Type: String
+    Description: "Pro forma CUR report name (Master Account ID)"
+    
+  RISPReportName:
+    Type: String
+    Description: "RISP CUR report name"
+
+  CrawlerSchedule:
+    Type: String
+    Description: "Cron expression for Crawler schedule (UTC)"
+    Default: "cron(0 2 * * ? *)"  # 每天UTC 02:00运行
+
+Resources:
+  # Lambda执行角色 - 增强权限支持EventBridge和调度
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaSetupAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - glue:CreateDatabase
+                  - glue:CreateCrawler
+                  - glue:StartCrawler
+                  - glue:GetDatabase
+                  - glue:GetCrawler
+                  - glue:UpdateCrawler
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:PassRole
+                  - iam:GetRole
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - lambda:AddPermission
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Crawler触发Lambda函数
+  CrawlerTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CrawlerTrigger"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CrawlerTriggerRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  glue = boto3.client('glue')
+                  
+                  # 从环境变量获取Crawler名称
+                  proforma_crawler = os.environ['PROFORMA_CRAWLER_NAME']
+                  risp_crawler = os.environ['RISP_CRAWLER_NAME']
+                  
+                  crawlers = [proforma_crawler, risp_crawler]
+                  results = []
+                  
+                  for crawler_name in crawlers:
+                      try:
+                          # 检查Crawler状态
+                          response = glue.get_crawler(Name=crawler_name)
+                          state = response['Crawler']['State']
+                          
+                          if state == 'READY':
+                              logger.info(f"Starting crawler: {crawler_name}")
+                              glue.start_crawler(Name=crawler_name)
+                              results.append(f"{crawler_name}: Started")
+                          else:
+                              logger.info(f"Crawler {crawler_name} is in state: {state}")
+                              results.append(f"{crawler_name}: Skipped ({state})")
+                              
+                      except Exception as e:
+                          logger.error(f"Error with crawler {crawler_name}: {str(e)}")
+                          results.append(f"{crawler_name}: Error - {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Crawler trigger completed',
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Function error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # Crawler触发函数的执行角色
+  CrawlerTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueCrawlerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:GetCrawlerMetrics
+                Resource: "*"
+
+  # 主要的Athena环境创建函数
+  CreateAthenaEnvironmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CreateAthenaEnvironment"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import uuid
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  glue = boto3.client('glue')
+                  iam = boto3.client('iam')
+                  events = boto3.client('events')
+                  lambda_client = boto3.client('lambda')
+
+                  # 获取参数
+                  proforma_bucket = event['ResourceProperties']['ProformaBucketName']
+                  risp_bucket = event['ResourceProperties']['RISPBucketName']
+                  proforma_report = event['ResourceProperties']['ProformaReportName']
+                  risp_report = event['ResourceProperties']['RISPReportName']
+                  crawler_schedule = event['ResourceProperties']['CrawlerSchedule']
+                  trigger_function_arn = event['ResourceProperties']['TriggerFunctionArn']
+
+                  # 获取Account ID
+                  org_info = organizations.describe_organization()
+                  account_id = org_info['Organization']['MasterAccountId']
+
+                  print(f"Setting up Athena with automated scheduling for Account: {account_id}")
+
+                  # 1. 创建两个Glue Database
+                  proforma_database_name = f"athenacurcfn_{account_id}"
+                  risp_database_name = f"athenacurcfn_risp_{account_id}"
+                  create_glue_database(glue, proforma_database_name, "Pro forma CUR data")
+                  create_glue_database(glue, risp_database_name, "RISP CUR data")
+
+                  # 2. 创建Crawler IAM角色
+                  crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
+
+                  # 3. 创建Glue Crawlers
+                  proforma_crawler_name = f"AWSCURCrawler-{account_id}"
+                  risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
+                  
+                  create_glue_crawler(glue, proforma_crawler_name, proforma_database_name, 
+                                    crawler_role_arn, proforma_bucket, proforma_report)
+                  create_glue_crawler(glue, risp_crawler_name, risp_database_name, 
+                                    crawler_role_arn, risp_bucket, risp_report)
+
+                  # 4. 创建EventBridge规则进行调度
+                  rule_name = f"CURCrawlerSchedule-{account_id}"
+                  create_crawler_schedule(events, lambda_client, rule_name, crawler_schedule, 
+                                        trigger_function_arn, account_id)
+
+                  # 5. 更新触发函数的环境变量
+                  update_trigger_function_env(lambda_client, trigger_function_arn, 
+                                             proforma_crawler_name, risp_crawler_name)
+
+                  # 6. 启动初始爬取
+                  start_crawlers(glue, proforma_crawler_name, risp_crawler_name)
+
+                  response_data = {
+                      "ProformaDatabaseName": proforma_database_name,
+                      "RISPDatabaseName": risp_database_name,
+                      "ProformaCrawlerName": proforma_crawler_name,
+                      "RISPCrawlerName": risp_crawler_name,
+                      "ScheduleRuleName": rule_name,
+                      "Message": "Athena environment with automated scheduling created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def create_glue_database(glue, database_name, description):
+              try:
+                  try:
+                      glue.get_database(Name=database_name)
+                      print(f"Database {database_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  glue.create_database(
+                      DatabaseInput={
+                          'Name': database_name,
+                          'Description': f'Database for {description}'
+                      }
+                  )
+                  print(f"Created database: {database_name}")
+
+              except Exception as e:
+                  print(f"Database creation error: {str(e)}")
+                  raise
+
+          def create_crawler_role(iam, account_id, proforma_bucket, risp_bucket):
+              role_name = f"AWSCURCrawlerRole-{account_id}-{uuid.uuid4().hex[:8]}"
+              
+              try:
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Principal": {"Service": "glue.amazonaws.com"},
+                          "Action": "sts:AssumeRole"
+                      }]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description=f"Role for Glue Crawlers - Account {account_id}"
+                  )
+
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+                  )
+
+                  s3_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Action": ["s3:GetObject", "s3:ListBucket"],
+                          "Resource": [
+                              f"arn:aws:s3:::{proforma_bucket}",
+                              f"arn:aws:s3:::{proforma_bucket}/*",
+                              f"arn:aws:s3:::{risp_bucket}",
+                              f"arn:aws:s3:::{risp_bucket}/*"
+                          ]
+                      }]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='S3CURAccess',
+                      PolicyDocument=json.dumps(s3_policy)
+                  )
+
+                  print(f"Created crawler role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"Crawler role creation error: {str(e)}")
+                  raise
+
+          def create_glue_crawler(glue, crawler_name, database_name, role_arn, bucket_name, report_name):
+              try:
+                  try:
+                      glue.get_crawler(Name=crawler_name)
+                      print(f"Crawler {crawler_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  s3_path = f"s3://{bucket_name}/daily/{report_name}/"
+                  
+                  glue.create_crawler(
+                      Name=crawler_name,
+                      Role=role_arn,
+                      DatabaseName=database_name,
+                      Description=f"Crawler for {report_name} CUR data",
+                      Targets={
+                          'S3Targets': [{
+                              'Path': s3_path,
+                              'Exclusions': [
+                                  '**.json', '**.yml', '**.sql', 
+                                  '**.csv', '**.gz', '**.zip'
+                              ]
+                          }]
+                      },
+                      RecrawlPolicy={'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'},
+                      SchemaChangePolicy={
+                          'UpdateBehavior': 'UPDATE_IN_DATABASE',
+                          'DeleteBehavior': 'LOG'
+                      }
+                  )
+                  print(f"Created crawler: {crawler_name}")
+
+              except Exception as e:
+                  print(f"Crawler creation error: {str(e)}")
+                  raise
+
+          def create_crawler_schedule(events, lambda_client, rule_name, schedule_expression, 
+                                     function_arn, account_id):
+              try:
+                  # 创建EventBridge规则
+                  events.put_rule(
+                      Name=rule_name,
+                      ScheduleExpression=schedule_expression,
+                      Description=f"Schedule for CUR Crawlers - Account {account_id}",
+                      State='ENABLED'
+                  )
+
+                  # 添加Lambda函数作为目标
+                  events.put_targets(
+                      Rule=rule_name,
+                      Targets=[{
+                          'Id': '1',
+                          'Arn': function_arn
+                      }]
+                  )
+
+                  # 给EventBridge权限调用Lambda函数
+                  try:
+                      lambda_client.add_permission(
+                          FunctionName=function_arn,
+                          StatementId=f"AllowExecutionFromEventBridge-{uuid.uuid4().hex[:8]}",
+                          Action='lambda:InvokeFunction',
+                          Principal='events.amazonaws.com',
+                          SourceArn=f"arn:aws:events:us-east-1:{account_id}:rule/{rule_name}"
+                      )
+                  except lambda_client.exceptions.ResourceConflictException:
+                      print("Permission already exists")
+
+                  print(f"Created schedule: {rule_name} with expression: {schedule_expression}")
+
+              except Exception as e:
+                  print(f"Schedule creation error: {str(e)}")
+                  raise
+
+          def update_trigger_function_env(lambda_client, function_arn, proforma_crawler, risp_crawler):
+              try:
+                  function_name = function_arn.split(':')[-1]
+                  
+                  lambda_client.update_function_configuration(
+                      FunctionName=function_name,
+                      Environment={
+                          'Variables': {
+                              'PROFORMA_CRAWLER_NAME': proforma_crawler,
+                              'RISP_CRAWLER_NAME': risp_crawler
+                          }
+                      }
+                  )
+                  print(f"Updated trigger function environment variables")
+
+              except Exception as e:
+                  print(f"Environment update error: {str(e)}")
+                  raise
+
+          def start_crawlers(glue, proforma_crawler_name, risp_crawler_name):
+              try:
+                  for crawler_name in [proforma_crawler_name, risp_crawler_name]:
+                      try:
+                          glue.start_crawler(Name=crawler_name)
+                          print(f"Started initial crawl for: {crawler_name}")
+                      except Exception as e:
+                          print(f"Could not start {crawler_name}: {str(e)}")
+              except Exception as e:
+                  print(f"Crawler startup error: {str(e)}")
+
+  # Custom Resource触发Lambda
+  CreateAthenaEnvironment:
+    Type: Custom::CreateAthenaEnvironment
+    Properties:
+      ServiceToken: !GetAtt CreateAthenaEnvironmentFunction.Arn
+      ProformaBucketName: !Ref ProformaBucketName
+      RISPBucketName: !Ref RISPBucketName
+      ProformaReportName: !Ref ProformaReportName
+      RISPReportName: !Ref RISPReportName
+      CrawlerSchedule: !Ref CrawlerSchedule
+      TriggerFunctionArn: !GetAtt CrawlerTriggerFunction.Arn
+
+Outputs:
+  ProformaDatabaseName:
+    Description: "Name of the Pro forma Athena database"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaDatabaseName"
+
+  RISPDatabaseName:
+    Description: "Name of the RISP Athena database"
+    Value: !GetAtt CreateAthenaEnvironment.RISPDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPDatabaseName"
+
+  ProformaCrawlerName:
+    Description: "Name of the Pro forma Crawler"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaCrawlerName"
+
+  RISPCrawlerName:
+    Description: "Name of the RISP Crawler"
+    Value: !GetAtt CreateAthenaEnvironment.RISPCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCrawlerName"
+
+  ScheduleRuleName:
+    Description: "Name of the EventBridge rule for Crawler scheduling"
+    Value: !GetAtt CreateAthenaEnvironment.ScheduleRuleName
+    Export:
+      Name: !Sub "${AWS::StackName}-ScheduleRuleName"
+
+  CrawlerTriggerFunctionName:
+    Description: "Name of the Crawler trigger Lambda function"
+    Value: !Ref CrawlerTriggerFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-CrawlerTriggerFunctionName"

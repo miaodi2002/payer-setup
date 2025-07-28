@@ -1,0 +1,767 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Advanced Athena environment with automated Crawler scheduling and S3 event triggers"
+
+Parameters:
+  ProformaBucketName:
+    Type: String
+    Description: "S3 bucket name for Pro forma CUR data"
+  
+  RISPBucketName:
+    Type: String
+    Description: "S3 bucket name for RISP CUR data"
+    
+  ProformaReportName:
+    Type: String
+    Description: "Pro forma CUR report name (Master Account ID)"
+    
+  RISPReportName:
+    Type: String
+    Description: "RISP CUR report name"
+
+  CrawlerSchedule:
+    Type: String
+    Description: "Cron expression for Crawler schedule (UTC)"
+    Default: "cron(0 2 * * ? *)"  # 每天UTC 02:00运行
+
+  EnableS3Triggers:
+    Type: String
+    Description: "Enable S3 event triggers for immediate processing"
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  ShouldCreateS3Triggers: !Equals [!Ref EnableS3Triggers, "true"]
+
+Resources:
+  # 增强的Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaSetupAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - glue:CreateDatabase
+                  - glue:CreateCrawler
+                  - glue:StartCrawler
+                  - glue:GetDatabase
+                  - glue:GetCrawler
+                  - glue:UpdateCrawler
+                  - glue:GetCrawlerMetrics
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:PassRole
+                  - iam:GetRole
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - lambda:AddPermission
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                  - sns:CreateTopic
+                  - sns:Subscribe
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # 智能Crawler触发Lambda函数
+  SmartCrawlerTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-SmartCrawlerTrigger"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CrawlerTriggerRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  glue = boto3.client('glue')
+                  
+                  # 从环境变量获取Crawler名称
+                  proforma_crawler = os.environ.get('PROFORMA_CRAWLER_NAME')
+                  risp_crawler = os.environ.get('RISP_CRAWLER_NAME')
+                  
+                  # 判断触发源
+                  trigger_source = determine_trigger_source(event)
+                  logger.info(f"Trigger source: {trigger_source}")
+                  
+                  if trigger_source == 's3_event':
+                      # S3事件触发 - 智能检测应该运行哪个Crawler
+                      crawlers_to_run = determine_crawlers_from_s3_event(event, proforma_crawler, risp_crawler)
+                  else:
+                      # 定时触发 - 运行所有Crawler
+                      crawlers_to_run = [proforma_crawler, risp_crawler]
+                  
+                  results = []
+                  
+                  for crawler_name in crawlers_to_run:
+                      if not crawler_name:
+                          continue
+                          
+                      try:
+                          # 智能检查是否需要运行
+                          should_run = should_run_crawler(glue, crawler_name, trigger_source)
+                          
+                          if should_run:
+                              response = glue.get_crawler(Name=crawler_name)
+                              state = response['Crawler']['State']
+                              
+                              if state == 'READY':
+                                  logger.info(f"Starting crawler: {crawler_name}")
+                                  glue.start_crawler(Name=crawler_name)
+                                  results.append(f"{crawler_name}: Started")
+                              else:
+                                  logger.info(f"Crawler {crawler_name} is in state: {state}")
+                                  results.append(f"{crawler_name}: Skipped ({state})")
+                          else:
+                              results.append(f"{crawler_name}: Not needed")
+                              
+                      except Exception as e:
+                          logger.error(f"Error with crawler {crawler_name}: {str(e)}")
+                          results.append(f"{crawler_name}: Error - {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Smart crawler trigger completed',
+                          'trigger_source': trigger_source,
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Function error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def determine_trigger_source(event):
+              """判断触发源：scheduled, s3_event, manual"""
+              if 'source' in event and event['source'] == 'aws.events':
+                  return 'scheduled'
+              elif 'Records' in event:
+                  for record in event['Records']:
+                      if record.get('eventSource') == 'aws:s3':
+                          return 's3_event'
+              return 'manual'
+
+          def determine_crawlers_from_s3_event(event, proforma_crawler, risp_crawler):
+              """从S3事件确定需要运行的Crawler"""
+              crawlers = []
+              
+              if 'Records' in event:
+                  for record in event['Records']:
+                      if record.get('eventSource') == 'aws:s3':
+                          bucket_name = record['s3']['bucket']['name']
+                          object_key = record['s3']['object']['key']
+                          
+                          logger.info(f"S3 event: {bucket_name}/{object_key}")
+                          
+                          # 根据bucket和路径判断应该触发哪个Crawler
+                          if 'risp' in bucket_name.lower() or 'risp' in object_key.lower():
+                              crawlers.append(risp_crawler)
+                          else:
+                              crawlers.append(proforma_crawler)
+              
+              return list(set(crawlers))  # 去重
+
+          def should_run_crawler(glue, crawler_name, trigger_source):
+              """智能判断是否需要运行Crawler"""
+              try:
+                  response = glue.get_crawler(Name=crawler_name)
+                  crawler = response['Crawler']
+                  
+                  # 定时触发总是运行
+                  if trigger_source == 'scheduled':
+                      return True
+                  
+                  # S3事件触发的智能判断
+                  if trigger_source == 's3_event':
+                      last_crawl = crawler.get('LastCrawl', {})
+                      
+                      if not last_crawl:
+                          return True  # 从未运行过
+                      
+                      last_crawl_time = last_crawl.get('StartTime')
+                      if last_crawl_time:
+                          # 如果上次运行时间超过1小时，允许运行
+                          time_diff = datetime.now(last_crawl_time.tzinfo) - last_crawl_time
+                          if time_diff > timedelta(hours=1):
+                              return True
+                          else:
+                              logger.info(f"Crawler {crawler_name} ran recently, skipping")
+                              return False
+                  
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f"Error checking crawler {crawler_name}: {str(e)}")
+                  return True  # 默认运行
+
+  # Crawler触发函数的执行角色
+  CrawlerTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueCrawlerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:GetCrawlerMetrics
+                Resource: "*"
+
+  # S3事件处理Lambda函数
+  S3EventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldCreateS3Triggers
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-S3EventProcessor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CrawlerTriggerRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """处理S3事件并触发相应的Crawler"""
+              try:
+                  lambda_client = boto3.client('lambda')
+                  trigger_function_name = os.environ['TRIGGER_FUNCTION_NAME']
+                  
+                  # 过滤相关的S3事件
+                  relevant_events = []
+                  
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record.get('eventSource') == 'aws:s3':
+                              object_key = record['s3']['object']['key']
+                              
+                              # 只处理Parquet文件
+                              if object_key.endswith('.parquet') and '/year=' in object_key:
+                                  relevant_events.append(record)
+                                  logger.info(f"Relevant S3 event: {object_key}")
+                  
+                  if relevant_events:
+                      # 调用Crawler触发函数
+                      response = lambda_client.invoke(
+                          FunctionName=trigger_function_name,
+                          InvocationType='Event',  # 异步调用
+                          Payload=json.dumps({'Records': relevant_events})
+                      )
+                      
+                      logger.info(f"Triggered crawler function for {len(relevant_events)} events")
+                  else:
+                      logger.info("No relevant S3 events found")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Processed {len(relevant_events)} relevant events'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing S3 event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # 主要的Athena环境创建函数（增强版）
+  CreateAthenaEnvironmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-CreateAdvancedAthenaEnvironment"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import uuid
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cleanup_resources(event)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  glue = boto3.client('glue')
+                  iam = boto3.client('iam')
+                  events = boto3.client('events')
+                  lambda_client = boto3.client('lambda')
+                  s3 = boto3.client('s3')
+
+                  # 获取参数
+                  proforma_bucket = event['ResourceProperties']['ProformaBucketName']
+                  risp_bucket = event['ResourceProperties']['RISPBucketName']
+                  proforma_report = event['ResourceProperties']['ProformaReportName']
+                  risp_report = event['ResourceProperties']['RISPReportName']
+                  crawler_schedule = event['ResourceProperties']['CrawlerSchedule']
+                  enable_s3_triggers = event['ResourceProperties']['EnableS3Triggers'] == 'true'
+                  trigger_function_arn = event['ResourceProperties']['TriggerFunctionArn']
+                  s3_processor_arn = event['ResourceProperties'].get('S3ProcessorFunctionArn')
+
+                  # 获取Account ID
+                  org_info = organizations.describe_organization()
+                  account_id = org_info['Organization']['MasterAccountId']
+
+                  print(f"Setting up advanced Athena environment for Account: {account_id}")
+
+                  # 1. 创建两个Glue Database
+                  proforma_database_name = f"athenacurcfn_{account_id}"
+                  risp_database_name = f"athenacurcfn_risp_{account_id}"
+                  create_glue_database(glue, proforma_database_name, "Pro forma CUR data")
+                  create_glue_database(glue, risp_database_name, "RISP CUR data")
+
+                  # 2. 创建Crawler IAM角色
+                  crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
+
+                  # 3. 创建增强的Glue Crawlers
+                  proforma_crawler_name = f"AWSCURCrawler-{account_id}"
+                  risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
+                  
+                  create_enhanced_glue_crawler(glue, proforma_crawler_name, proforma_database_name, 
+                                             crawler_role_arn, proforma_bucket, proforma_report)
+                  create_enhanced_glue_crawler(glue, risp_crawler_name, risp_database_name, 
+                                             crawler_role_arn, risp_bucket, risp_report)
+
+                  # 4. 创建EventBridge规则进行调度
+                  rule_name = f"CURCrawlerSchedule-{account_id}"
+                  create_crawler_schedule(events, lambda_client, rule_name, crawler_schedule, 
+                                        trigger_function_arn, account_id)
+
+                  # 5. 设置S3事件触发（如果启用）
+                  if enable_s3_triggers and s3_processor_arn:
+                      setup_s3_event_triggers(s3, lambda_client, proforma_bucket, risp_bucket, 
+                                            s3_processor_arn, account_id)
+
+                  # 6. 更新触发函数的环境变量
+                  update_trigger_function_env(lambda_client, trigger_function_arn, 
+                                             proforma_crawler_name, risp_crawler_name)
+
+                  # 7. 更新S3处理函数的环境变量（如果存在）
+                  if s3_processor_arn:
+                      update_s3_processor_env(lambda_client, s3_processor_arn, trigger_function_arn)
+
+                  # 8. 启动初始爬取
+                  start_crawlers(glue, proforma_crawler_name, risp_crawler_name)
+
+                  response_data = {
+                      "ProformaDatabaseName": proforma_database_name,
+                      "RISPDatabaseName": risp_database_name,
+                      "ProformaCrawlerName": proforma_crawler_name,
+                      "RISPCrawlerName": risp_crawler_name,
+                      "ScheduleRuleName": rule_name,
+                      "S3TriggersEnabled": enable_s3_triggers,
+                      "Message": "Advanced Athena environment with smart scheduling created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def create_glue_database(glue, database_name, description):
+              try:
+                  try:
+                      glue.get_database(Name=database_name)
+                      print(f"Database {database_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  glue.create_database(
+                      DatabaseInput={
+                          'Name': database_name,
+                          'Description': f'Database for {description}'
+                      }
+                  )
+                  print(f"Created database: {database_name}")
+
+              except Exception as e:
+                  print(f"Database creation error: {str(e)}")
+                  raise
+
+          def create_crawler_role(iam, account_id, proforma_bucket, risp_bucket):
+              role_name = f"AWSCURCrawlerRole-{account_id}-{uuid.uuid4().hex[:8]}"
+              
+              try:
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Principal": {"Service": "glue.amazonaws.com"},
+                          "Action": "sts:AssumeRole"
+                      }]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description=f"Role for Glue Crawlers - Account {account_id}"
+                  )
+
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+                  )
+
+                  s3_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Action": ["s3:GetObject", "s3:ListBucket"],
+                          "Resource": [
+                              f"arn:aws:s3:::{proforma_bucket}",
+                              f"arn:aws:s3:::{proforma_bucket}/*",
+                              f"arn:aws:s3:::{risp_bucket}",
+                              f"arn:aws:s3:::{risp_bucket}/*"
+                          ]
+                      }]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='S3CURAccess',
+                      PolicyDocument=json.dumps(s3_policy)
+                  )
+
+                  print(f"Created crawler role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"Crawler role creation error: {str(e)}")
+                  raise
+
+          def create_enhanced_glue_crawler(glue, crawler_name, database_name, role_arn, bucket_name, report_name):
+              try:
+                  try:
+                      existing_crawler = glue.get_crawler(Name=crawler_name)
+                      print(f"Crawler {crawler_name} already exists, updating...")
+                      
+                      # 更新现有Crawler配置
+                      s3_path = f"s3://{bucket_name}/daily/{report_name}/"
+                      
+                      glue.update_crawler(
+                          Name=crawler_name,
+                          Role=role_arn,
+                          DatabaseName=database_name,
+                          Description=f"Enhanced crawler for {report_name} CUR data with smart scheduling",
+                          Targets={
+                              'S3Targets': [{
+                                  'Path': s3_path,
+                                  'Exclusions': [
+                                      '**.json', '**.yml', '**.sql', 
+                                      '**.csv', '**.gz', '**.zip'
+                                  ]
+                              }]
+                          },
+                          RecrawlPolicy={'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'},
+                          SchemaChangePolicy={
+                              'UpdateBehavior': 'UPDATE_IN_DATABASE',
+                              'DeleteBehavior': 'LOG'
+                          }
+                      )
+                      print(f"Updated crawler: {crawler_name}")
+                      return
+                      
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  s3_path = f"s3://{bucket_name}/daily/{report_name}/"
+                  
+                  glue.create_crawler(
+                      Name=crawler_name,
+                      Role=role_arn,
+                      DatabaseName=database_name,
+                      Description=f"Enhanced crawler for {report_name} CUR data with smart scheduling",
+                      Targets={
+                          'S3Targets': [{
+                              'Path': s3_path,
+                              'Exclusions': [
+                                  '**.json', '**.yml', '**.sql', 
+                                  '**.csv', '**.gz', '**.zip'
+                              ]
+                          }]
+                      },
+                      RecrawlPolicy={'RecrawlBehavior': 'CRAWL_NEW_FOLDERS_ONLY'},
+                      SchemaChangePolicy={
+                          'UpdateBehavior': 'UPDATE_IN_DATABASE',
+                          'DeleteBehavior': 'LOG'
+                      }
+                  )
+                  print(f"Created enhanced crawler: {crawler_name}")
+
+              except Exception as e:
+                  print(f"Enhanced crawler creation error: {str(e)}")
+                  raise
+
+          def create_crawler_schedule(events, lambda_client, rule_name, schedule_expression, 
+                                     function_arn, account_id):
+              try:
+                  # 创建EventBridge规则
+                  events.put_rule(
+                      Name=rule_name,
+                      ScheduleExpression=schedule_expression,
+                      Description=f"Smart schedule for CUR Crawlers - Account {account_id}",
+                      State='ENABLED'
+                  )
+
+                  # 添加Lambda函数作为目标
+                  events.put_targets(
+                      Rule=rule_name,
+                      Targets=[{
+                          'Id': '1',
+                          'Arn': function_arn,
+                          'Input': json.dumps({'source': 'aws.events', 'trigger_type': 'scheduled'})
+                      }]
+                  )
+
+                  # 给EventBridge权限调用Lambda函数
+                  try:
+                      lambda_client.add_permission(
+                          FunctionName=function_arn,
+                          StatementId=f"AllowScheduledExecution-{uuid.uuid4().hex[:8]}",
+                          Action='lambda:InvokeFunction',
+                          Principal='events.amazonaws.com',
+                          SourceArn=f"arn:aws:events:us-east-1:{account_id}:rule/{rule_name}"
+                      )
+                  except lambda_client.exceptions.ResourceConflictException:
+                      print("Schedule permission already exists")
+
+                  print(f"Created smart schedule: {rule_name} with expression: {schedule_expression}")
+
+              except Exception as e:
+                  print(f"Schedule creation error: {str(e)}")
+                  raise
+
+          def setup_s3_event_triggers(s3, lambda_client, proforma_bucket, risp_bucket, 
+                                     s3_processor_arn, account_id):
+              """设置S3事件触发器"""
+              try:
+                  buckets = [proforma_bucket, risp_bucket]
+                  
+                  for bucket_name in buckets:
+                      try:
+                          # 添加Lambda权限
+                          lambda_client.add_permission(
+                              FunctionName=s3_processor_arn,
+                              StatementId=f"AllowS3Execution-{bucket_name}-{uuid.uuid4().hex[:8]}",
+                              Action='lambda:InvokeFunction',
+                              Principal='s3.amazonaws.com',
+                              SourceArn=f"arn:aws:s3:::{bucket_name}"
+                          )
+
+                          # 设置S3通知配置
+                          notification_config = {
+                              'LambdaConfigurations': [{
+                                  'Id': f'CURDataArrival-{bucket_name}',
+                                  'LambdaFunctionArn': s3_processor_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {'Name': 'suffix', 'Value': '.parquet'},
+                                              {'Name': 'prefix', 'Value': 'daily/'}
+                                          ]
+                                      }
+                                  }
+                              }]
+                          }
+
+                          s3.put_bucket_notification_configuration(
+                              Bucket=bucket_name,
+                              NotificationConfiguration=notification_config
+                          )
+
+                          print(f"Set up S3 event trigger for bucket: {bucket_name}")
+
+                      except Exception as bucket_error:
+                          print(f"Error setting up S3 trigger for {bucket_name}: {str(bucket_error)}")
+                          # 继续处理其他bucket
+
+              except Exception as e:
+                  print(f"S3 event trigger setup error: {str(e)}")
+                  # 不抛出异常，因为这不是关键功能
+
+          def update_trigger_function_env(lambda_client, function_arn, proforma_crawler, risp_crawler):
+              try:
+                  function_name = function_arn.split(':')[-1]
+                  
+                  lambda_client.update_function_configuration(
+                      FunctionName=function_name,
+                      Environment={
+                          'Variables': {
+                              'PROFORMA_CRAWLER_NAME': proforma_crawler,
+                              'RISP_CRAWLER_NAME': risp_crawler
+                          }
+                      }
+                  )
+                  print(f"Updated trigger function environment variables")
+
+              except Exception as e:
+                  print(f"Environment update error: {str(e)}")
+                  raise
+
+          def update_s3_processor_env(lambda_client, s3_processor_arn, trigger_function_arn):
+              try:
+                  function_name = s3_processor_arn.split(':')[-1]
+                  trigger_function_name = trigger_function_arn.split(':')[-1]
+                  
+                  lambda_client.update_function_configuration(
+                      FunctionName=function_name,
+                      Environment={
+                          'Variables': {
+                              'TRIGGER_FUNCTION_NAME': trigger_function_name
+                          }
+                      }
+                  )
+                  print(f"Updated S3 processor function environment variables")
+
+              except Exception as e:
+                  print(f"S3 processor environment update error: {str(e)}")
+                  # 不是关键错误
+
+          def start_crawlers(glue, proforma_crawler_name, risp_crawler_name):
+              try:
+                  for crawler_name in [proforma_crawler_name, risp_crawler_name]:
+                      try:
+                          glue.start_crawler(Name=crawler_name)
+                          print(f"Started initial crawl for: {crawler_name}")
+                      except Exception as e:
+                          print(f"Could not start {crawler_name}: {str(e)}")
+              except Exception as e:
+                  print(f"Crawler startup error: {str(e)}")
+
+          def cleanup_resources(event):
+              """清理资源（删除时调用）"""
+              try:
+                  # 这里可以添加清理逻辑，如删除EventBridge规则等
+                  print("Cleanup completed")
+              except Exception as e:
+                  print(f"Cleanup error: {str(e)}")
+
+  # Custom Resource触发Lambda
+  CreateAdvancedAthenaEnvironment:
+    Type: Custom::CreateAdvancedAthenaEnvironment
+    Properties:
+      ServiceToken: !GetAtt CreateAthenaEnvironmentFunction.Arn
+      ProformaBucketName: !Ref ProformaBucketName
+      RISPBucketName: !Ref RISPBucketName
+      ProformaReportName: !Ref ProformaReportName
+      RISPReportName: !Ref RISPReportName
+      CrawlerSchedule: !Ref CrawlerSchedule
+      EnableS3Triggers: !Ref EnableS3Triggers
+      TriggerFunctionArn: !GetAtt SmartCrawlerTriggerFunction.Arn
+      S3ProcessorFunctionArn: !If
+        - ShouldCreateS3Triggers
+        - !GetAtt S3EventProcessorFunction.Arn
+        - !Ref "AWS::NoValue"
+
+Outputs:
+  ProformaDatabaseName:
+    Description: "Name of the Pro forma Athena database"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.ProformaDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaDatabaseName"
+
+  RISPDatabaseName:
+    Description: "Name of the RISP Athena database"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.RISPDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPDatabaseName"
+
+  ProformaCrawlerName:
+    Description: "Name of the Pro forma Crawler"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.ProformaCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaCrawlerName"
+
+  RISPCrawlerName:
+    Description: "Name of the RISP Crawler"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.RISPCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCrawlerName"
+
+  ScheduleRuleName:
+    Description: "Name of the EventBridge rule for Crawler scheduling"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.ScheduleRuleName
+    Export:
+      Name: !Sub "${AWS::StackName}-ScheduleRuleName"
+
+  SmartCrawlerTriggerFunctionName:
+    Description: "Name of the Smart Crawler trigger Lambda function"
+    Value: !Ref SmartCrawlerTriggerFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-SmartCrawlerTriggerFunctionName"
+
+  S3EventProcessorFunctionName:
+    Description: "Name of the S3 event processor Lambda function"
+    Value: !If
+      - ShouldCreateS3Triggers
+      - !Ref S3EventProcessorFunction
+      - "Not Created"
+    Export:
+      Name: !Sub "${AWS::StackName}-S3EventProcessorFunctionName"
+
+  S3TriggersEnabled:
+    Description: "Whether S3 event triggers are enabled"
+    Value: !GetAtt CreateAdvancedAthenaEnvironment.S3TriggersEnabled
+    Export:
+      Name: !Sub "${AWS::StackName}-S3TriggersEnabled"

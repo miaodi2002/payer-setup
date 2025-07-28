@@ -2,7 +2,7 @@
   "version": "1.0",
   "created": "2025-07-24T19:55:00+09:00",
   "description": "Payer部署模板版本注册表",
-  "current_version": "v1",
+  "current_version": "v1.3",
   "versions": {
     "v0": {
       "status": "deprecated",
@@ -68,7 +68,8 @@
       ],
       "enhancements": [
         "Module 2: BillingGroup启用自动账号关联",
-        "Module 3/4: CUR关闭Include resource IDs选项"
+        "Module 3/4: CUR关闭Include resource IDs选项",
+        "Module 5: 添加Crawler自动调度和S3事件触发"
       ],
       "modules": {
         "01-ou-scp": {
@@ -92,11 +93,12 @@
           "notes": "RISP CUR配置，Elite-new11验证通过，已关闭resource IDs"
         },
         "05-athena-setup": {
-          "templates": ["athena_setup.yaml"],
-          "status": "stable",
-          "notes": "修复版 - 简化Lambda代码，保留核心功能（Glue数据库/Crawlers）",
-          "fixes": ["简化内联Lambda代码到4KB以内", "移除复杂S3通知和状态表功能"],
-          "validation": "Elite-new11成功创建Glue Crawlers和Athena数据库"
+          "templates": ["athena_setup.yaml", "athena_setup_with_scheduler.yaml", "athena_setup_advanced_scheduler.yaml"],
+          "status": "production-ready",
+          "notes": "多版本支持 - 基础版、调度版、高级版，生产部署验证",
+          "fixes": ["简化内联Lambda代码到4KB以内", "移除复杂S3通知和状态表功能", "修复Lambda权限和环境变量问题"],
+          "enhancements": ["自动Crawler调度", "S3事件触发", "智能运行控制", "生产部署验证"],
+          "validation": "Elite-new11成功创建Glue Crawlers和Athena数据库，增加自动化调度功能，生产环境验证通过"
         },
         "06-account-auto-management": {
           "templates": ["account_auto_move.yaml"],
@@ -111,12 +113,85 @@
           "notes": "CloudFront监控功能，Elite-new11验证通过"
         }
       }
+    },
+    "v1.3": {
+      "status": "stable",
+      "description": "生产验证版本 - Crawler自动调度实装完成",
+      "created": "2025-07-28T14:40:00+09:00",
+      "validation": {
+        "deployment": "Elite-new11",
+        "date": "2025-07-28",
+        "account": "272312908613",
+        "status": "success",
+        "features": "automated-crawler-scheduling"
+      },
+      "production_deployments": [
+        {
+          "payer_name": "Elite-new11",
+          "account_id": "272312908613",
+          "stack_name": "payer-Elite-new11-athena-with-scheduler",
+          "deployment_date": "2025-07-28",
+          "scheduler_type": "basic",
+          "status": "active"
+        }
+      ],
+      "fixes": [
+        "Module 5: 修复Lambda IAM权限缺少UpdateFunctionConfiguration问题",
+        "Module 5: 修复CrawlerTriggerFunction缺少import os问题",
+        "Module 5: 完善EventBridge调度器权限配置"
+      ],
+      "enhancements": [
+        "Module 5: 实装Elite-new11 Crawler自动调度功能",
+        "Module 5: 验证每日UTC 02:00自动触发机制",
+        "Module 5: 确认Lambda环境变量正确配置",
+        "Module 5: 验证双Crawler协调运行机制"
+      ],
+      "modules": {
+        "01-ou-scp": {
+          "templates": ["auto_SCP_1.yaml"],
+          "status": "stable",
+          "notes": "OU和SCP设置，稳定运行"
+        },
+        "02-billing-conductor": {
+          "templates": ["billing_conductor.yaml"],
+          "status": "stable",
+          "notes": "BillingConductor核心功能，已启用自动账号关联"
+        },
+        "03-cur-proforma": {
+          "templates": ["cur_export_proforma.yaml"],
+          "status": "stable",
+          "notes": "Pro forma CUR配置，已关闭resource IDs"
+        },
+        "04-cur-risp": {
+          "templates": ["cur_export_risp.yaml"],
+          "status": "stable",
+          "notes": "RISP CUR配置，已关闭resource IDs"
+        },
+        "05-athena-setup": {
+          "templates": ["athena_setup.yaml", "athena_setup_with_scheduler.yaml", "athena_setup_advanced_scheduler.yaml"],
+          "status": "production-deployed",
+          "notes": "自动调度功能生产部署完成，Elite-new11验证通过",
+          "fixes": ["Lambda权限问题修复", "环境变量配置修复", "import语句修复"],
+          "enhancements": ["生产环境自动调度验证", "双Crawler协调运行", "EventBridge调度器配置"],
+          "production_validation": "Elite-new11成功部署并运行自动调度功能，每日UTC 02:00自动触发Crawler"
+        },
+        "06-account-auto-management": {
+          "templates": ["account_auto_move.yaml"],
+          "status": "stable",
+          "notes": "智能函数命名策略，稳定运行"
+        },
+        "07-cloudfront-monitoring": {
+          "templates": ["cloudfront_monitoring.yaml", "oam-link-stackset.yaml"],
+          "status": "stable",
+          "notes": "CloudFront监控功能，稳定运行"
+        }
+      }
     }
   },
   "deployment_recommendations": {
     "production": {
-      "version": "v1",
-      "notes": "已通过Elite-new11生产验证"
+      "version": "v1.3",
+      "notes": "最新生产验证版本，包含自动调度功能，Elite-new11实装验证通过"
     },
     "testing": {
       "version": "v1",
@@ -140,6 +215,27 @@
     ]
   },
   "changelog": [
+    {
+      "version": "v1.3",
+      "date": "2025-07-28",
+      "changes": [
+        "Module 5: 修复并实装Crawler自动调度功能到Elite-new11",
+        "修复Lambda权限问题：添加UpdateFunctionConfiguration权限",
+        "修复Lambda代码问题：添加缺失的import os语句",
+        "生产验证：Elite-new11自动调度功能正常运行",
+        "EventBridge调度器：每日UTC 02:00自动触发验证成功"
+      ]
+    },
+    {
+      "version": "v1.2",
+      "date": "2025-07-28",
+      "changes": [
+        "Module 5: 实现Crawler自动调度系统",
+        "添加基础版、调度版、高级版三种Athena模板",
+        "支持定时调度和S3事件触发两种模式",
+        "智能Crawler运行控制避免重复执行"
+      ]
+    },
     {
       "version": "v1.1",
       "date": "2025-07-28",

@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Setup Athena environment for CUR data analysis - FIXED VERSION with simplified Lambda"
+
+Parameters:
+  ProformaBucketName:
+    Type: String
+    Description: "S3 bucket name for Pro forma CUR data"
+  
+  RISPBucketName:
+    Type: String
+    Description: "S3 bucket name for RISP CUR data"
+    
+  ProformaReportName:
+    Type: String
+    Description: "Pro forma CUR report name (Master Account ID)"
+    
+  RISPReportName:
+    Type: String
+    Description: "RISP CUR report name"
+
+Resources:
+  # Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaSetupAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - glue:CreateDatabase
+                  - glue:CreateCrawler
+                  - glue:StartCrawler
+                  - glue:GetDatabase
+                  - glue:GetCrawler
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:PassRole
+                  - iam:GetRole
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # 简化的Lambda函数：只创建基础Athena环境
+  CreateAthenaEnvironmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import uuid
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  glue = boto3.client('glue')
+                  iam = boto3.client('iam')
+
+                  # 获取参数
+                  proforma_bucket = event['ResourceProperties']['ProformaBucketName']
+                  risp_bucket = event['ResourceProperties']['RISPBucketName']
+                  proforma_report = event['ResourceProperties']['ProformaReportName']
+                  risp_report = event['ResourceProperties']['RISPReportName']
+
+                  # 获取Account ID
+                  org_info = organizations.describe_organization()
+                  account_id = org_info['Organization']['MasterAccountId']
+
+                  print(f"Setting up Athena for Account: {account_id}")
+
+                  # 1. 创建两个Glue Database
+                  proforma_database_name = f"athenacurcfn_{account_id}"
+                  risp_database_name = f"athenacurcfn_risp_{account_id}"
+                  create_glue_database(glue, proforma_database_name, "Pro forma CUR data")
+                  create_glue_database(glue, risp_database_name, "RISP CUR data")
+
+                  # 2. 创建Crawler IAM角色
+                  crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
+
+                  # 3. 创建Glue Crawlers
+                  proforma_crawler_name = f"AWSCURCrawler-{account_id}"
+                  risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
+                  
+                  create_glue_crawler(glue, proforma_crawler_name, proforma_database_name, 
+                                    crawler_role_arn, proforma_bucket, proforma_report)
+                  create_glue_crawler(glue, risp_crawler_name, risp_database_name, 
+                                    crawler_role_arn, risp_bucket, risp_report)
+
+                  # 4. 启动初始爬取
+                  start_crawlers(glue, proforma_crawler_name, risp_crawler_name)
+
+                  response_data = {
+                      "ProformaDatabaseName": proforma_database_name,
+                      "RISPDatabaseName": risp_database_name,
+                      "ProformaCrawlerName": proforma_crawler_name,
+                      "RISPCrawlerName": risp_crawler_name,
+                      "Message": "Athena environment created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def create_glue_database(glue, database_name, description):
+              try:
+                  try:
+                      glue.get_database(Name=database_name)
+                      print(f"Database {database_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  glue.create_database(
+                      DatabaseInput={
+                          'Name': database_name,
+                          'Description': f'Database for {description}'
+                      }
+                  )
+                  print(f"Created database: {database_name}")
+
+              except Exception as e:
+                  print(f"Database creation error: {str(e)}")
+                  raise
+
+          def create_crawler_role(iam, account_id, proforma_bucket, risp_bucket):
+              role_name = f"AWSCURCrawlerRole-{account_id}-{uuid.uuid4().hex[:8]}"
+              
+              try:
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Principal": {"Service": "glue.amazonaws.com"},
+                          "Action": "sts:AssumeRole"
+                      }]
+                  }
+
+                  role = iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      Description=f"Role for Glue Crawlers - Account {account_id}"
+                  )
+
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+                  )
+
+                  s3_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Action": ["s3:GetObject", "s3:ListBucket"],
+                          "Resource": [
+                              f"arn:aws:s3:::{proforma_bucket}",
+                              f"arn:aws:s3:::{proforma_bucket}/*",
+                              f"arn:aws:s3:::{risp_bucket}",
+                              f"arn:aws:s3:::{risp_bucket}/*"
+                          ]
+                      }]
+                  }
+
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='S3CURAccess',
+                      PolicyDocument=json.dumps(s3_policy)
+                  )
+
+                  print(f"Created crawler role: {role_name}")
+                  return role['Role']['Arn']
+
+              except Exception as e:
+                  print(f"Crawler role creation error: {str(e)}")
+                  raise
+
+          def create_glue_crawler(glue, crawler_name, database_name, role_arn, bucket_name, report_name):
+              try:
+                  try:
+                      glue.get_crawler(Name=crawler_name)
+                      print(f"Crawler {crawler_name} already exists")
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  s3_path = f"s3://{bucket_name}/daily/{report_name}/"
+
+                  glue.create_crawler(
+                      Name=crawler_name,
+                      Role=role_arn,
+                      DatabaseName=database_name,
+                      Description=f'Crawler for CUR data in {bucket_name}',
+                      Targets={
+                          'S3Targets': [{
+                              'Path': s3_path,
+                              'Exclusions': ['**.json', '**.yml', '**.sql', '**.csv', '**.gz', '**.zip']
+                          }]
+                      },
+                      SchemaChangePolicy={
+                          'UpdateBehavior': 'UPDATE_IN_DATABASE',
+                          'DeleteBehavior': 'LOG'
+                      }
+                  )
+
+                  print(f"Created crawler: {crawler_name}")
+
+              except Exception as e:
+                  print(f"Crawler creation error: {str(e)}")
+                  raise
+
+          def start_crawlers(glue, proforma_crawler_name, risp_crawler_name):
+              for crawler_name in [proforma_crawler_name, risp_crawler_name]:
+                  try:
+                      glue.start_crawler(Name=crawler_name)
+                      print(f"Started crawler: {crawler_name}")
+                  except Exception as e:
+                      print(f"Start crawler error for {crawler_name}: {str(e)}")
+
+  # Custom Resource触发Lambda
+  CreateAthenaEnvironment:
+    Type: Custom::CreateAthenaEnvironment
+    Properties:
+      ServiceToken: !GetAtt CreateAthenaEnvironmentFunction.Arn
+      ProformaBucketName: !Ref ProformaBucketName
+      RISPBucketName: !Ref RISPBucketName
+      ProformaReportName: !Ref ProformaReportName
+      RISPReportName: !Ref RISPReportName
+
+Outputs:
+  ProformaDatabaseName:
+    Description: "Glue database name for Pro forma CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaDatabaseName"
+
+  RISPDatabaseName:
+    Description: "Glue database name for RISP CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.RISPDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPDatabaseName"
+
+  ProformaCrawlerName:
+    Description: "Pro forma CUR crawler name"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaCrawlerName"
+
+  RISPCrawlerName:
+    Description: "RISP CUR crawler name"
+    Value: !GetAtt CreateAthenaEnvironment.RISPCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCrawlerName"
