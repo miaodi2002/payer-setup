@@ -55,6 +55,7 @@
       "status": "stable",
       "description": "稳定版本 - Elite-new11验证通过",
       "created": "2025-07-24T19:55:00+09:00",
+      "updated": "2025-07-28T14:35:00+09:00",
       "validation": {
         "deployment": "Elite-new11",
         "date": "2025-07-24",
@@ -65,6 +66,10 @@
         "Module 5: 简化Lambda代码解决zip文件问题",
         "Module 6: 智能函数命名避免64字符限制"
       ],
+      "enhancements": [
+        "Module 2: BillingGroup启用自动账号关联",
+        "Module 3/4: CUR关闭Include resource IDs选项"
+      ],
       "modules": {
         "01-ou-scp": {
           "templates": ["auto_SCP_1.yaml"],
@@ -74,17 +79,17 @@
         "02-billing-conductor": {
           "templates": ["billing_conductor.yaml"],
           "status": "stable",
-          "notes": "BillingConductor核心功能，Elite-new11成功创建账户163814384698"
+          "notes": "BillingConductor核心功能，Elite-new11成功创建账户163814384698，已启用自动账号关联"
         },
         "03-cur-proforma": {
           "templates": ["cur_export_proforma.yaml"],
           "status": "stable",
-          "notes": "Pro forma CUR配置，Elite-new11验证通过"
+          "notes": "Pro forma CUR配置，Elite-new11验证通过，已关闭resource IDs"
         },
         "04-cur-risp": {
           "templates": ["cur_export_risp.yaml"],
           "status": "stable",
-          "notes": "RISP CUR配置，Elite-new11验证通过"
+          "notes": "RISP CUR配置，Elite-new11验证通过，已关闭resource IDs"
         },
         "05-athena-setup": {
           "templates": ["athena_setup.yaml"],
@@ -135,6 +140,15 @@
     ]
   },
   "changelog": [
+    {
+      "version": "v1.1",
+      "date": "2025-07-28",
+      "changes": [
+        "Module 2: 启用BillingGroup自动账号关联功能",
+        "Module 3/4: 关闭CUR报告中的Include resource IDs选项",
+        "优化成本和性能"
+      ]
+    },
     {
       "version": "v1",
       "date": "2025-07-24",

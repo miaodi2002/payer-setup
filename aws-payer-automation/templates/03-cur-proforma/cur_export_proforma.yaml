@@ -315,7 +315,7 @@ Resources:
                       'TimeUnit': 'DAILY',
                       'Format': 'Parquet',
                       'Compression': 'Parquet',
-                      'AdditionalSchemaElements': ['RESOURCES'],
+                      'AdditionalSchemaElements': [],  # 关闭Include resource IDs
                       'S3Bucket': bucket_name,
                       'S3Prefix': 'daily',
                       'S3Region': 'us-east-1',

@@ -394,7 +394,8 @@ Resources:
                       'Description': f'Billing group for customer original pricing - Account {primary_account_id}',
                       'PrimaryAccountId': primary_account_id,
                       'AccountGrouping': {
-                          'LinkedAccountIds': [primary_account_id]
+                          'LinkedAccountIds': [primary_account_id],
+                          'AutoAssociate': True  # 启用自动账号关联
                       },
                       'ComputationPreference': {
                           'PricingPlanArn': standard_plan_arn
@@ -440,7 +441,8 @@ Resources:
                           Description=f'Billing group for customer original pricing - Account {primary_account_id}',
                           PrimaryAccountId=primary_account_id,
                           AccountGrouping={
-                              'LinkedAccountIds': [primary_account_id]
+                              'LinkedAccountIds': [primary_account_id],
+                              'AutoAssociate': True  # 启用自动账号关联
                           },
                           ComputationPreference={}  # 空的 ComputationPreference
                       )
