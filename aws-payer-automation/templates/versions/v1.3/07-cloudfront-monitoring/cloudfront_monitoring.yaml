@@ -6,11 +6,14 @@ Parameters:
     Type: String
     Description: "Name of the Payer (use Master Account name from AWS Organizations)"
     
+  PayerAccountId:
+    Type: String
+    Description: "Master Account ID for this Payer"
     
   CloudFrontThresholdMB:
     Type: Number
-    Default: 100
-    Description: "CloudFront traffic threshold in MB (15-minute window)"
+    Default: 5120
+    Description: "CloudFront traffic threshold in MB (15-minute window) - Default: 5GB"
     
   TelegramGroupId:
     Type: String
@@ -95,6 +98,7 @@ Resources:
       Environment:
         Variables:
           PAYER_NAME: !Ref PayerName
+          PAYER_ACCOUNT_ID: !Ref PayerAccountId
           TELEGRAM_GROUP_ID: !Ref TelegramGroupId
           TELEGRAM_API_ENDPOINT: !Ref TelegramApiEndpoint
           THRESHOLD_MB: !Ref CloudFrontThresholdMB
@@ -204,18 +208,20 @@ Resources:
           
           def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details):
               payer_name = os.environ['PAYER_NAME']
+              payer_account_id = os.environ['PAYER_ACCOUNT_ID']
               threshold_mb = os.environ['THRESHOLD_MB']
               
-              # Build formatted message
-              message = build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
+              # Build formatted message with Payer name and ID
+              payer_display = f"{payer_name}({payer_account_id})"
+              message = build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
               
               # Send to Telegram
               send_telegram_message(message)
           
-          def build_alert_message(payer_name, alarm_name, high_usage_accounts, threshold_mb, alarm_details):
+          def build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details):
               timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
               
-              message = f"🚨 CloudFront流量告警 - {payer_name}\n\n"
+              message = f"🚨 CloudFront流量告警 - {payer_display}\n\n"
               
               if high_usage_accounts:
                   message += "📊 超量账户详情:\n"
@@ -286,11 +292,14 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: missing
       Metrics:
-        - Id: "total_cloudfront"
-          Label: !Sub "${PayerName}_CloudFront_15min_Total"
-          ReturnData: true
+        - Id: "total_cloudfront_bytes"
+          ReturnData: false
           Expression: 'SELECT SUM(BytesDownloaded) FROM SCHEMA("AWS/CloudFront", DistributionId,Region)'
           Period: 900
+        - Id: "total_cloudfront_mb"
+          Label: !Sub "${PayerName}_CloudFront_15min_Total_MB"
+          ReturnData: true
+          Expression: "total_cloudfront_bytes / 1048576"
 
   # Lambda permission for SNS to invoke CloudFront alert function
   CloudFrontAlertPermission:

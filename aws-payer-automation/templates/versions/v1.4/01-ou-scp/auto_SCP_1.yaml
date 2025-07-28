@@ -1,0 +1,614 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Create OU and attach SCP to Root, Free, Normal OU"
+
+Parameters:
+  RootId:
+    Type: String
+    Description: "AWS Organizations root ID"
+
+Resources:
+  # 建立 Free OU
+  FreeOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Free"
+      ParentId: !Ref RootId
+
+  # 建立 Block OU
+  BlockOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Block"
+      ParentId: !Ref RootId
+
+  # 建立 Normal OU
+  NormalOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: "Normal"
+      ParentId: !Ref RootId
+
+  DenyAccessNonPayAsGoDenyBigSizeACM:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyAccessNonPayAsGo_DenyBigSize_ACM"
+      Description: "SCP to deny reserved instances, large EC2 instances, and ACM CA operations."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyAccessNonPayAsGo"
+            Effect: "Deny"
+            Action:
+              - "ec2:PurchaseReservedInstancesOffering"
+              - "ec2:AcceptReservedInstancesExchangeQuote"
+              - "ec2:CancelCapacityReservation"
+              - "ec2:CancelReservedInstancesListing"
+              - "ec2:CreateCapacityReservation"
+              - "ec2:CreateReservedInstancesListing"
+              - "savingsplans:*"
+              - "ec2:DescribeReservedInstances"
+              - "ec2:DescribeReservedInstancesListings"
+              - "ec2:ModifyReservedInstances"
+              - "rds:PurchaseReservedDBInstancesOffering"
+              - "elasticache:PurchaseReservedCacheNodesOffering"
+              - "directconnect:*"
+              - "outposts:*"
+            Resource: "*"
+
+          - Sid: "limitedSize"
+            Effect: "Deny"
+            Action: "ec2:RunInstances"
+            Resource: "arn:aws:ec2:*:*:instance/*"
+            Condition:
+              ForAnyValue:StringNotLike:
+                "ec2:InstanceType":
+                  - "*.nano"
+                  - "*.small"
+                  - "*.micro"
+                  - "*.medium"
+                  - "*.large"
+                  - "*.xlarge"
+                  - "*.2xlarge"
+                  - "*.3xlarge"
+                  - "*.4xlarge"
+                  - "*.6xlarge"
+                  - "*.8xlarge"
+                  - "*.9xlarge"
+                  - "*.10xlarge"
+                  - "*.12xlarge"
+                  - "*.16xlarge"
+
+          - Sid: "DenyACM"
+            Effect: "Deny"
+            Action:
+              - "acm-pca:CreateCertificateAuthority"
+              - "acm-pca:DeleteCertificateAuthority"
+              - "acm-pca:CreatePermission"
+              - "acm-pca:DeletePermission"
+              - "acm-pca:DescribeCertificateAuthorityAuditReport"
+              - "acm-pca:RestoreCertificateAuthority"
+              - "acm-pca:TagCertificateAuthority"
+              - "acm-pca:UntagCertificateAuthority"
+            Resource: "*"
+
+  DenyLeaveOrganization:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyLeaveOrganization"
+      Description: "SCP to prevent accounts from leaving the AWS Organization."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Statement1"
+            Effect: "Deny"
+            Action:
+              - "organizations:LeaveOrganization"
+            Resource: "*"
+
+  DenyRoot:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyRoot"
+      Description: "SCP to deny all actions for the root user."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyRootUser"
+            Effect: "Deny"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn: "arn:aws:iam::*:root"  
+        
+  DenyRootChange:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyRootChange"
+      Description: "SCP to deny account email address change."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Deny"
+            Action: "iam:UpdateAccountEmailAddress"
+            Resource: "*"
+
+  DenySupport:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenySupport"
+      Description: "SCP to deny support plan changes."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Deny"
+            Action: "supportplans:*"
+            Resource: "*"
+
+  DenyShield:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "DenyShield"
+      Description: "SCP to deny Shield subscription updates."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Statement1"
+            Effect: "Deny"
+            Action:
+              - "shield:UpdateSubscription"
+            Resource: "*"
+
+  DenyCloudFront:
+    Type: "AWS::Organizations::Policy"
+    Properties:
+      Name: "Deny_CloudFront"
+      Description: "Service Control Policy to deny all CloudFront actions for specified IAM users."
+      Type: "SERVICE_CONTROL_POLICY"
+      Content: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Deny"
+            Action:
+              - "cloudfront:*"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn:
+                  - "arn:aws:iam::*:root"
+                  - "arn:aws:iam::*:user/a*"
+                  - "arn:aws:iam::*:user/A*"
+                  - "arn:aws:iam::*:user/b*"
+                  - "arn:aws:iam::*:user/B*"
+                  - "arn:aws:iam::*:user/c*"
+                  - "arn:aws:iam::*:user/C*"
+                  - "arn:aws:iam::*:user/d*"
+                  - "arn:aws:iam::*:user/D*"
+                  - "arn:aws:iam::*:user/e*"
+                  - "arn:aws:iam::*:user/E*"
+                  - "arn:aws:iam::*:user/f*"
+                  - "arn:aws:iam::*:user/F*"
+                  - "arn:aws:iam::*:user/g*"
+                  - "arn:aws:iam::*:user/G*"
+                  - "arn:aws:iam::*:user/h*"
+                  - "arn:aws:iam::*:user/H*"
+                  - "arn:aws:iam::*:user/i*"
+                  - "arn:aws:iam::*:user/I*"
+                  - "arn:aws:iam::*:user/j*"
+                  - "arn:aws:iam::*:user/J*"
+                  - "arn:aws:iam::*:user/k*"
+                  - "arn:aws:iam::*:user/K*"
+                  - "arn:aws:iam::*:user/l*"
+                  - "arn:aws:iam::*:user/L*"
+                  - "arn:aws:iam::*:user/m*"
+                  - "arn:aws:iam::*:user/M*"
+                  - "arn:aws:iam::*:user/n*"
+                  - "arn:aws:iam::*:user/N*"
+                  - "arn:aws:iam::*:user/o*"
+                  - "arn:aws:iam::*:user/O*"
+                  - "arn:aws:iam::*:user/p*"
+                  - "arn:aws:iam::*:user/P*"
+                  - "arn:aws:iam::*:user/q*"
+                  - "arn:aws:iam::*:user/Q*"
+                  - "arn:aws:iam::*:user/r*"
+                  - "arn:aws:iam::*:user/R*"
+                  - "arn:aws:iam::*:user/s*"
+                  - "arn:aws:iam::*:user/S*"
+                  - "arn:aws:iam::*:user/t*"
+                  - "arn:aws:iam::*:user/T*"
+                  - "arn:aws:iam::*:user/u*"
+                  - "arn:aws:iam::*:user/U*"
+                  - "arn:aws:iam::*:user/v*"
+                  - "arn:aws:iam::*:user/V*"
+                  - "arn:aws:iam::*:user/w*"
+                  - "arn:aws:iam::*:user/W*"
+                  - "arn:aws:iam::*:user/x*"
+                  - "arn:aws:iam::*:user/X*"
+                  - "arn:aws:iam::*:user/y*"
+                  - "arn:aws:iam::*:user/Y*"
+                  - "arn:aws:iam::*:user/z*"
+                  - "arn:aws:iam::*:user/Z*"
+                  - "arn:aws:iam::*:user/0*"
+                  - "arn:aws:iam::*:user/1*"
+                  - "arn:aws:iam::*:user/2*"
+                  - "arn:aws:iam::*:user/3*"
+                  - "arn:aws:iam::*:user/4*"
+                  - "arn:aws:iam::*:user/5*"
+                  - "arn:aws:iam::*:user/6*"
+                  - "arn:aws:iam::*:user/7*"
+                  - "arn:aws:iam::*:user/8*"
+                  - "arn:aws:iam::*:user/9*"
+                  - "arn:aws:iam::*:user/+*"
+                  - "arn:aws:iam::*:user/=*"
+                  - "arn:aws:iam::*:user/,*"
+                  - "arn:aws:iam::*:user/.*"
+                  - "arn:aws:iam::*:user/_*"
+                  - "arn:aws:iam::*:user/-*"
+
+  # Lambda IAM Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaOrganizationsRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAttachPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:AttachPolicy
+                  - organizations:EnablePolicyType
+                  - organizations:DisablePolicyType
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:DescribePolicy
+                  - organizations:ListRoots
+                  - organizations:ListPolicies
+                  - organizations:ListPoliciesForTarget
+                Resource: "*"
+
+  # Lambda Function (Python)
+  AttachSCPLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AttachSCPToOU
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  organizations = boto3.client('organizations')
+                  
+                  # 1. Check if SCP is enabled, if not, enable it
+                  ensure_scp_enabled(organizations)
+                  
+                  # 2. Attach SCPs to targets
+                  for scp in event['ResourceProperties']['SCPAssignments']:
+                      attach_policy_with_retry(organizations, scp["PolicyId"], scp["TargetId"])
+
+                  response_data = {"Message": "All SCPs Attached Successfully"}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def ensure_scp_enabled(organizations):
+              """Ensure SCP policy type is enabled with comprehensive detection"""
+              try:
+                  # Get organization info and root ID first
+                  org_info = organizations.describe_organization()
+                  roots = organizations.list_roots()
+                  root_id = roots['Roots'][0]['Id']
+                  
+                  print(f"Organization ID: {org_info['Organization']['Id']}")
+                  print(f"Root ID: {root_id}")
+                  
+                  available_types = org_info['Organization']['AvailablePolicyTypes']
+                  print(f"Available policy types: {available_types}")
+                  
+                  # More comprehensive SCP status check
+                  scp_enabled = False
+                  scp_exists = False
+                  
+                  for policy_type in available_types:
+                      if policy_type['Type'] == 'SERVICE_CONTROL_POLICY':
+                          scp_exists = True
+                          if policy_type['Status'] == 'ENABLED':
+                              scp_enabled = True
+                              print(f"SCP policy type found with status: {policy_type['Status']} - ENABLED")
+                          else:
+                              print(f"SCP policy type found with status: {policy_type['Status']} - NOT ENABLED")
+                          break
+                  
+                  if not scp_exists:
+                      print("SCP policy type not found in available types")
+                  
+                  # Additional verification: Try to list policies to confirm SCP is truly enabled
+                  if scp_enabled:
+                      try:
+                          print("Verifying SCP enablement by attempting to list policies...")
+                          policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                          print(f"Successfully listed {len(policies.get('Policies', []))} SCP policies - SCP is confirmed enabled")
+                          return  # SCP is truly enabled, no need to continue
+                      except Exception as list_error:
+                          print(f"Failed to list SCP policies despite status showing ENABLED: {str(list_error)}")
+                          if "PolicyTypeNotEnabledException" in str(list_error):
+                              print("SCP is not actually enabled despite status - will attempt to enable")
+                              scp_enabled = False
+                          else:
+                              print("Unexpected error listing policies, but continuing with enablement check")
+                  
+                  # If we reach here, SCP needs to be enabled
+                  if not scp_enabled:
+                      print("SCP needs to be enabled. Attempting enablement...")
+                      max_attempts = 3
+                      
+                      for attempt in range(max_attempts):
+                          try:
+                              print(f"Enablement attempt {attempt + 1}/{max_attempts}")
+                              
+                              # Enable SCP
+                              enable_response = organizations.enable_policy_type(
+                                  RootId=root_id,
+                                  PolicyType='SERVICE_CONTROL_POLICY'
+                              )
+                              print(f"Enable response: {enable_response}")
+                              
+                              # Wait progressively longer
+                              wait_time = 20 + (attempt * 10)  # 20s, 30s, 40s
+                              print(f"Waiting {wait_time} seconds for SCP enablement to propagate...")
+                              time.sleep(wait_time)
+                              
+                              # Verify enablement by listing policies
+                              try:
+                                  policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                                  print(f"✅ SCP enablement confirmed - can list {len(policies.get('Policies', []))} policies")
+                                  
+                                  # Double-check with describe_organization
+                                  org_info_after = organizations.describe_organization()
+                                  available_types_after = org_info_after['Organization']['AvailablePolicyTypes']
+                                  scp_status_after = next((pt['Status'] for pt in available_types_after if pt['Type'] == 'SERVICE_CONTROL_POLICY'), 'NOT_FOUND')
+                                  print(f"Organization status after enablement: {scp_status_after}")
+                                  
+                                  return  # Successfully enabled
+                                  
+                              except Exception as verify_error:
+                                  print(f"Verification failed on attempt {attempt + 1}: {str(verify_error)}")
+                                  if attempt == max_attempts - 1:
+                                      raise Exception(f"Failed to enable SCP after {max_attempts} attempts. Last error: {str(verify_error)}")
+                                  continue
+                              
+                          except Exception as enable_error:
+                              error_msg = str(enable_error)
+                              print(f"Enable attempt {attempt + 1} failed: {error_msg}")
+                              
+                              if "PolicyTypeAlreadyEnabledException" in error_msg:
+                                  print("SCP was already enabled according to the service")
+                                  # Still verify it works
+                                  try:
+                                      policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                                      print(f"✅ SCP confirmed working - can list {len(policies.get('Policies', []))} policies")
+                                      return
+                                  except Exception as verify_error:
+                                      print(f"SCP shows as enabled but verification failed: {str(verify_error)}")
+                                      if attempt == max_attempts - 1:
+                                          raise Exception(f"SCP shows as enabled but cannot be used: {str(verify_error)}")
+                                      continue
+                              else:
+                                  if attempt == max_attempts - 1:
+                                      raise Exception(f"Failed to enable SCP after {max_attempts} attempts. Last error: {error_msg}")
+                                  time.sleep(10)  # Wait before retry
+                  
+                  print("SCP enablement process completed")
+                      
+              except Exception as e:
+                  print(f"Error in ensure_scp_enabled: {str(e)}")
+                  raise
+
+          def attach_policy_with_retry(organizations, policy_id, target_id, max_retries=5):
+              """Attach policy with retry mechanism with enhanced troubleshooting"""
+              
+              # First, let's try to understand what's happening by checking the target
+              try:
+                  print(f"Attempting to attach policy {policy_id} to target {target_id}")
+                  
+                  # Check if the target is the root or an OU
+                  if target_id.startswith('r-'):
+                      print(f"Target {target_id} is a ROOT")
+                      # Verify root exists
+                      roots = organizations.list_roots()
+                      root_ids = [root['Id'] for root in roots['Roots']]
+                      if target_id not in root_ids:
+                          raise Exception(f"Root {target_id} not found in organization")
+                  elif target_id.startswith('ou-'):
+                      print(f"Target {target_id} is an OU")
+                      # Try to get OU details
+                      try:
+                          ou_details = organizations.describe_organizational_unit(OrganizationalUnitId=target_id)
+                          print(f"OU details: {ou_details}")
+                      except Exception as ou_error:
+                          print(f"Warning: Could not get OU details: {str(ou_error)}")
+                  
+                  # Check policy details
+                  try:
+                      policy_details = organizations.describe_policy(PolicyId=policy_id)
+                      print(f"Policy type: {policy_details['Policy']['Type']}")
+                      print(f"Policy name: {policy_details['Policy']['Name']}")
+                  except Exception as policy_error:
+                      print(f"Warning: Could not get policy details: {str(policy_error)}")
+                  
+                  # Check if policy is already attached
+                  try:
+                      policies_for_target = organizations.list_policies_for_target(
+                          TargetId=target_id,
+                          Filter='SERVICE_CONTROL_POLICY'
+                      )
+                      attached_policy_ids = [p['Id'] for p in policies_for_target['Policies']]
+                      if policy_id in attached_policy_ids:
+                          print(f"Policy {policy_id} is already attached to {target_id}")
+                          return
+                      else:
+                          print(f"Policy {policy_id} not yet attached. Currently attached: {attached_policy_ids}")
+                  except Exception as list_error:
+                      print(f"Could not list policies for target: {str(list_error)}")
+                  
+              except Exception as diagnostic_error:
+                  print(f"Error in diagnostic phase: {str(diagnostic_error)}")
+              
+              # Now try to attach with retries
+              for attempt in range(max_retries):
+                  try:
+                      print(f"Attach attempt {attempt + 1}/{max_retries}")
+                      
+                      # Try a different approach: re-verify SCP is enabled before each attempt
+                      if attempt > 0:
+                          org_info = organizations.describe_organization()
+                          available_types = org_info['Organization']['AvailablePolicyTypes']
+                          scp_status = next((pt['Status'] for pt in available_types if pt['Type'] == 'SERVICE_CONTROL_POLICY'), 'NOT_FOUND')
+                          print(f"Pre-attach verification - SCP status: {scp_status}")
+                          
+                          # Try to list policies again to ensure we still have access
+                          try:
+                              policies = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                              print(f"Pre-attach verification - can list {len(policies.get('Policies', []))} policies")
+                          except Exception as list_error:
+                              print(f"Pre-attach verification failed: {str(list_error)}")
+                              if "PolicyTypeNotEnabledException" in str(list_error):
+                                  print("SCP status inconsistent - attempting re-enable")
+                                  ensure_scp_enabled(organizations)
+                      
+                      # Actual attach attempt
+                      organizations.attach_policy(PolicyId=policy_id, TargetId=target_id)
+                      print(f"✅ Successfully attached policy {policy_id} to {target_id}")
+                      return
+                      
+                  except Exception as e:
+                      error_msg = str(e)
+                      print(f"Attach attempt {attempt + 1} failed: {error_msg}")
+                      
+                      if "PolicyTypeNotEnabledException" in error_msg:
+                          if attempt < max_retries - 1:
+                              # For this specific error, try some additional debugging
+                              print("PolicyTypeNotEnabledException detected - investigating...")
+                              
+                              # Check if this is a region-specific issue
+                              try:
+                                  session = boto3.Session()
+                                  current_region = session.region_name
+                                  print(f"Current region: {current_region}")
+                              except:
+                                  print("Could not determine current region")
+                              
+                              # Try to force re-enable SCP
+                              print("Attempting to force re-enable SCP...")
+                              try:
+                                  roots = organizations.list_roots()
+                                  root_id = roots['Roots'][0]['Id']
+                                  
+                                  # Try to disable and re-enable (this might fail, but let's try)
+                                  try:
+                                      organizations.disable_policy_type(
+                                          RootId=root_id,
+                                          PolicyType='SERVICE_CONTROL_POLICY'
+                                      )
+                                      print("Disabled SCP policy type")
+                                      time.sleep(10)
+                                  except Exception as disable_error:
+                                      print(f"Could not disable SCP (expected): {str(disable_error)}")
+                                  
+                                  # Re-enable
+                                  organizations.enable_policy_type(
+                                      RootId=root_id,
+                                      PolicyType='SERVICE_CONTROL_POLICY'
+                                  )
+                                  print("Re-enabled SCP policy type")
+                                  
+                              except Exception as force_error:
+                                  print(f"Force re-enable failed: {str(force_error)}")
+                              
+                              wait_time = 30 + (attempt * 15)  # 30s, 45s, 60s, 75s
+                              print(f"Waiting {wait_time} seconds before retry...")
+                              time.sleep(wait_time)
+                              continue
+                          else:
+                              # Final attempt failed
+                              print("❌ All attempts failed with PolicyTypeNotEnabledException")
+                              print("This appears to be an AWS internal issue or account limitation")
+                              raise Exception(f"Failed to attach policy after {max_retries} attempts. AWS may have internal inconsistency between SCP status and attachment capability. Error: {error_msg}")
+                      else:
+                          # Different error
+                          if attempt == max_retries - 1:
+                              raise Exception(f"Failed to attach policy {policy_id} to {target_id} after {max_retries} attempts: {error_msg}")
+                          time.sleep(10)
+                          continue
+
+  # Custom Resource 觸發 Lambda
+  InvokeLambda:
+    Type: Custom::InvokeLambda
+    Properties:
+      ServiceToken: !GetAtt AttachSCPLambda.Arn
+      SCPAssignments:
+        - PolicyId: !Ref DenyShield
+          TargetId: !Ref RootId
+        - PolicyId: !Ref DenySupport
+          TargetId: !Ref FreeOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref FreeOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyRoot
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyCloudFront
+          TargetId: !Ref BlockOU
+        - PolicyId: !Ref DenyRootChange
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenySupport
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenyLeaveOrganization
+          TargetId: !Ref NormalOU
+        - PolicyId: !Ref DenyAccessNonPayAsGoDenyBigSizeACM
+          TargetId: !Ref NormalOU
+
+Outputs:
+  FreeOUId:
+    Description: "ID of the Free OU"
+    Value: !Ref FreeOU
+    Export:
+      Name: !Sub "${AWS::StackName}-FreeOUId"
+
+  BlockOUId:
+    Description: "ID of the Block OU"
+    Value: !Ref BlockOU
+    Export:
+      Name: !Sub "${AWS::StackName}-BlockOUId"
+
+  NormalOUId:
+    Description: "ID of the Normal OU"
+    Value: !Ref NormalOU
+    Export:
+      Name: !Sub "${AWS::StackName}-NormalOUId"

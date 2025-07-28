@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Create RISP Legacy CUR Export without Pro forma configuration"
+
+Resources:
+  # Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaRISPCURExportRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CURAndS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - cur:PutReportDefinition
+                  - cur:DescribeReportDefinitions
+                  - cur:ModifyReportDefinition
+                  - s3:CreateBucket
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda函数
+  CreateRISPCURExportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateRISPCURExport
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # 删除时不删除S3 Bucket和CUR，避免数据丢失
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  cur = boto3.client('cur', region_name='us-east-1')  # CUR只能在us-east-1创建
+                  s3 = boto3.client('s3', region_name='us-east-1')
+
+                  # 1. 获取Master Account ID
+                  org_info = organizations.describe_organization()
+                  master_account_id = org_info['Organization']['MasterAccountId']
+                  
+                  print(f"Master Account ID: {master_account_id}")
+
+                  # 2. 创建S3 Bucket
+                  bucket_name = f"bip-risp-cur-{master_account_id}"
+                  bucket_region = create_s3_bucket(s3, bucket_name)
+                  
+                  print(f"S3 Bucket created: {bucket_name} in {bucket_region}")
+
+                  # 3. 设置S3 Bucket Policy
+                  set_s3_bucket_policy(s3, bucket_name, master_account_id)
+                  
+                  # 4. 创建RISP CUR Export（不使用Pro forma）
+                  report_name = f"risp-{master_account_id}"
+                  cur_arn = create_risp_cur_export(cur, report_name, bucket_name)
+                  
+                  print(f"RISP CUR Export created: {report_name}")
+
+                  response_data = {
+                      "BucketName": bucket_name,
+                      "BucketRegion": bucket_region,
+                      "ReportName": report_name,
+                      "CURArn": cur_arn,
+                      "Message": "RISP Legacy CUR Export created successfully"
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def create_s3_bucket(s3, bucket_name):
+              """创建或配置S3 Bucket"""
+              try:
+                  bucket_exists = False
+                  
+                  # 检查bucket是否已存在
+                  try:
+                      response = s3.head_bucket(Bucket=bucket_name)
+                      print(f"✅ Bucket {bucket_name} already exists")
+                      bucket_exists = True
+                  except Exception as head_error:
+                      print(f"Bucket {bucket_name} does not exist, will create: {str(head_error)}")
+
+                  # 如果bucket不存在，创建它
+                  if not bucket_exists:
+                      try:
+                          print(f"Creating bucket {bucket_name} in us-east-1...")
+                          s3.create_bucket(Bucket=bucket_name)
+                          print(f"✅ Successfully created bucket {bucket_name}")
+                      except Exception as create_error:
+                          error_msg = str(create_error)
+                          if "BucketAlreadyExists" in error_msg or "BucketAlreadyOwnedByYou" in error_msg:
+                              print(f"✅ Bucket {bucket_name} already exists (detected during creation)")
+                              bucket_exists = True
+                          else:
+                              print(f"❌ Failed to create bucket: {error_msg}")
+                              raise
+
+                  # 无论bucket是新创建的还是已存在的，都确保正确配置
+                  print(f"Configuring bucket {bucket_name} settings...")
+                  
+                  # 设置公共访问阻止
+                  try:
+                      s3.put_public_access_block(
+                          Bucket=bucket_name,
+                          PublicAccessBlockConfiguration={
+                              'BlockPublicAcls': True,
+                              'IgnorePublicAcls': True,
+                              'BlockPublicPolicy': True,
+                              'RestrictPublicBuckets': True
+                          }
+                      )
+                      print(f"✅ Public access block configured for {bucket_name}")
+                  except Exception as pab_error:
+                      print(f"⚠️ Public access block configuration failed: {str(pab_error)}")
+                      # 不抛出异常，因为这不是关键失败
+                  
+                  # 启用版本控制
+                  try:
+                      s3.put_bucket_versioning(
+                          Bucket=bucket_name,
+                          VersioningConfiguration={'Status': 'Enabled'}
+                      )
+                      print(f"✅ Versioning enabled for {bucket_name}")
+                  except Exception as version_error:
+                      print(f"⚠️ Versioning configuration failed: {str(version_error)}")
+                      # 不抛出异常，因为这不是关键失败
+                  
+                  return 'us-east-1'
+                  
+              except Exception as e:
+                  print(f"❌ S3 bucket creation/configuration error: {str(e)}")
+                  # 如果是配置错误但bucket存在，不抛出异常
+                  if "NoSuchBucket" not in str(e):
+                      print(f"⚠️ Bucket may exist but configuration failed, continuing...")
+                      return 'us-east-1'
+                  raise
+
+          def set_s3_bucket_policy(s3, bucket_name, account_id):
+              """设置S3 Bucket Policy允许CUR写入"""
+              bucket_policy = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Effect": "Allow",
+                          "Principal": {
+                              "Service": "billingreports.amazonaws.com"
+                          },
+                          "Action": [
+                              "s3:GetBucketAcl",
+                              "s3:GetBucketPolicy"
+                          ],
+                          "Resource": f"arn:aws:s3:::{bucket_name}",
+                          "Condition": {
+                              "StringEquals": {
+                                  "aws:SourceAccount": account_id
+                              }
+                          }
+                      },
+                      {
+                          "Effect": "Allow",
+                          "Principal": {
+                              "Service": "billingreports.amazonaws.com"
+                          },
+                          "Action": "s3:PutObject",
+                          "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                          "Condition": {
+                              "StringEquals": {
+                                  "aws:SourceAccount": account_id
+                              }
+                          }
+                      }
+                  ]
+              }
+              
+              try:
+                  s3.put_bucket_policy(
+                      Bucket=bucket_name,
+                      Policy=json.dumps(bucket_policy)
+                  )
+                  print(f"Bucket policy set for {bucket_name}")
+              except Exception as e:
+                  print(f"Bucket policy error: {str(e)}")
+                  raise
+
+          def create_risp_cur_export(cur, report_name, bucket_name):
+              """创建RISP Legacy CUR Export（不使用Pro forma）"""
+              try:
+                  # 检查报告是否已存在
+                  try:
+                      existing_reports = cur.describe_report_definitions()
+                      for report in existing_reports['ReportDefinitions']:
+                          if report['ReportName'] == report_name:
+                              print(f"CUR report {report_name} already exists")
+                              return f"arn:aws:cur:us-east-1::report/{report_name}"
+                  except:
+                      pass
+
+                  # 创建标准Legacy CUR（不包含BillingViewArn）
+                  response = cur.put_report_definition(
+                      ReportDefinition={
+                          'ReportName': report_name,
+                          'TimeUnit': 'DAILY',
+                          'Format': 'Parquet',
+                          'Compression': 'Parquet',
+                          'AdditionalSchemaElements': [],  # 关闭Include resource IDs
+                          'S3Bucket': bucket_name,
+                          'S3Prefix': 'daily',
+                          'S3Region': 'us-east-1',
+                          'AdditionalArtifacts': ['ATHENA'],
+                          'RefreshClosedReports': True,
+                          'ReportVersioning': 'OVERWRITE_REPORT'
+                          # 注意：这里不包含BillingViewArn，因为不使用Pro forma
+                      }
+                  )
+                  
+                  return f"arn:aws:cur:us-east-1::report/{report_name}"
+                  
+              except Exception as e:
+                  print(f"RISP CUR creation error: {str(e)}")
+                  raise
+
+  # Custom Resource触发Lambda
+  CreateRISPCURExport:
+    Type: Custom::CreateRISPCURExport
+    Properties:
+      ServiceToken: !GetAtt CreateRISPCURExportFunction.Arn
+
+Outputs:
+  RISPBucketName:
+    Description: "Name of the S3 bucket for RISP CUR data"
+    Value: !GetAtt CreateRISPCURExport.BucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCURBucketName"
+
+  RISPBucketRegion:
+    Description: "Region of the S3 bucket for RISP"
+    Value: !GetAtt CreateRISPCURExport.BucketRegion
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCURBucketRegion"
+
+  RISPReportName:
+    Description: "Name of the RISP CUR report"
+    Value: !GetAtt CreateRISPCURExport.ReportName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCURReportName"
+
+  RISPCURArn:
+    Description: "ARN of the RISP CUR report"
+    Value: !GetAtt CreateRISPCURExport.CURArn
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCURArn"

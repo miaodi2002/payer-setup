@@ -2,7 +2,7 @@
   "version": "1.0",
   "created": "2025-07-24T19:55:00+09:00",
   "description": "Payer部署模板版本注册表",
-  "current_version": "v1.3",
+  "current_version": "v1.4",
   "versions": {
     "v0": {
       "status": "deprecated",
@@ -186,6 +186,62 @@
           "notes": "CloudFront监控功能，稳定运行"
         }
       }
+    },
+    "v1.4": {
+      "status": "stable",
+      "description": "CloudFront监控增强版本 - 5GB阈值和Payer信息显示",
+      "created": "2025-07-28T16:00:00+09:00",
+      "validation": {
+        "deployment": "branch-cloudfront-fix",
+        "date": "2025-07-28",
+        "status": "ready-for-testing",
+        "features": "cloudfront-monitoring-enhancements"
+      },
+      "enhancements": [
+        "Module 7: CloudFront流量监控阈值提升至5GB (5120MB)",
+        "Module 7: 预警消息显示Payer名称和账户ID格式化",
+        "Module 7: 增强CloudWatch指标精度和单位转换",
+        "Module 7: 添加PayerAccountId参数支持"
+      ],
+      "modules": {
+        "01-ou-scp": {
+          "templates": ["auto_SCP_1.yaml"],
+          "status": "stable",
+          "notes": "OU和SCP设置，稳定运行"
+        },
+        "02-billing-conductor": {
+          "templates": ["billing_conductor.yaml"],
+          "status": "stable",
+          "notes": "BillingConductor核心功能，已启用自动账号关联"
+        },
+        "03-cur-proforma": {
+          "templates": ["cur_export_proforma.yaml"],
+          "status": "stable",
+          "notes": "Pro forma CUR配置，已关闭resource IDs"
+        },
+        "04-cur-risp": {
+          "templates": ["cur_export_risp.yaml"],
+          "status": "stable",
+          "notes": "RISP CUR配置，已关闭resource IDs"
+        },
+        "05-athena-setup": {
+          "templates": ["athena_setup.yaml", "athena_setup_with_scheduler.yaml", "athena_setup_advanced_scheduler.yaml"],
+          "status": "production-deployed",
+          "notes": "自动调度功能生产部署完成，Elite-new11验证通过"
+        },
+        "06-account-auto-management": {
+          "templates": ["account_auto_move.yaml"],
+          "status": "stable",
+          "notes": "智能函数命名策略，稳定运行"
+        },
+        "07-cloudfront-monitoring": {
+          "templates": ["cloudfront_monitoring.yaml", "oam-link-stackset.yaml"],
+          "status": "enhanced",
+          "notes": "CloudFront监控增强：5GB阈值、Payer信息显示、精确单位转换",
+          "enhancements": ["5GB流量阈值", "Payer名称和ID显示", "CloudWatch指标精度优化", "参数化账户ID"],
+          "changes": "流量监控阈值从100MB提升至5120MB，预警消息格式优化为PayerName(AccountID)"
+        }
+      }
     }
   },
   "deployment_recommendations": {
@@ -215,6 +271,17 @@
     ]
   },
   "changelog": [
+    {
+      "version": "v1.4",
+      "date": "2025-07-28",
+      "changes": [
+        "Module 7: CloudFront流量监控阈值大幅提升至5GB (5120MB)",
+        "Module 7: 预警消息优化显示Payer名称和账户ID：PayerName(AccountID)格式",
+        "Module 7: 改进CloudWatch指标处理和单位转换精度",
+        "Module 7: 新增PayerAccountId参数支持动态账户ID显示",
+        "增强CloudFront监控的可用性和信息完整性"
+      ]
+    },
     {
       "version": "v1.3",
       "date": "2025-07-28",
