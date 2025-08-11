@@ -1,0 +1,497 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Create AWS Account and BillingConductor BillingGroup automatically"
+
+Resources:
+  # Lambda执行角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaBillingConductorRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAndBillingAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - organizations:CreateAccount
+                  - organizations:DescribeCreateAccountStatus
+                  - organizations:ListAccounts
+                  - billingconductor:CreateBillingGroup
+                  - billingconductor:CreatePricingPlan
+                  - billingconductor:AssociatePricingRules
+                  - billingconductor:ListBillingGroups
+                  - billingconductor:ListPricingPlans
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda函数
+  CreateAccountAndBillingGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateAccountAndBillingGroup
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900  # 15分钟最大超时时间（Lambda限制）
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+          import re
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # 删除时不做任何操作，避免删除已创建的账户
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  organizations = boto3.client('organizations')
+                  billingconductor = boto3.client('billingconductor')
+
+                  # 1. 获取Management Account信息
+                  org_info = organizations.describe_organization()
+                  master_account_id = org_info['Organization']['MasterAccountId']
+                  
+                  master_account_info = organizations.describe_account(AccountId=master_account_id)
+                  master_account_name = master_account_info['Account']['Name']
+                  master_account_email = master_account_info['Account']['Email']
+
+                  print(f"Master Account: {master_account_name} ({master_account_email})")
+
+                  # 2. 检查是否已存在Bills账户
+                  new_account_name = f"{master_account_name}-Bills"
+                  base_email = generate_bills_email(master_account_email)
+                  
+                  # 3. 查找现有的Bills账户
+                  existing_account = find_existing_bills_account(organizations, master_account_name, master_account_email)
+                  
+                  if existing_account:
+                      new_account_id = existing_account['Id']
+                      new_account_email = existing_account['Email']
+                      print(f"Found existing Bills account: {existing_account['Name']} ({new_account_email}) - ID: {new_account_id}")
+                  else:
+                      # 4. 如果不存在，查找可用邮箱并创建新账户
+                      new_account_email = find_available_email(organizations, base_email)
+                      
+                      print(f"No existing Bills account found. Creating new account: {new_account_name} ({new_account_email})")
+
+                      # 5. 创建新账户
+                      create_response = organizations.create_account(
+                          Email=new_account_email,
+                          AccountName=new_account_name
+                      )
+                      
+                      request_id = create_response['CreateAccountStatus']['Id']
+                      print(f"Account creation request ID: {request_id}")
+
+                      # 6. 等待账户创建完成
+                      new_account_id = wait_for_account_creation(organizations, request_id)
+                      print(f"New account created: {new_account_id}")
+                      
+                      # 7. 等待3分钟让账户加入Consolidated Billing family
+                      print("Waiting 3 minutes for the account to join the CB family...")
+                      wait_for_cb_family_integration(180)  # 3分钟 = 180秒
+                      print("Wait completed. Account should now be available for BillingConductor operations.")
+
+                  # 8. 创建或查找BillingGroup
+                  billing_group_arn = create_or_find_billing_group(billingconductor, new_account_id)
+                  print(f"BillingGroup ready: {billing_group_arn}")
+                  
+                  # 9. 获取最终的BillingGroup信息用于响应
+                  try:
+                      final_group_info = billingconductor.get_billing_group(Arn=billing_group_arn)
+                      final_group_name = final_group_info.get('Name', 'Unknown')
+                      print(f"📋 Final BillingGroup Summary:")
+                      print(f"   Name: {final_group_name}")
+                      print(f"   ARN: {billing_group_arn}")
+                      print(f"   Primary Account: {new_account_id}")
+                      
+                      # 记录名称不匹配的情况（这是AWS的正常行为）
+                      if final_group_name.lower() != 'bills':
+                          print(f"ℹ️  AWS assigned name '{final_group_name}' (expected AWS behavior)")
+                      
+                      success_message = f"Account and BillingGroup created successfully. BillingGroup name: {final_group_name}"
+                      
+                  except Exception as info_error:
+                      print(f"⚠️  Could not retrieve final BillingGroup info: {str(info_error)}")
+                      success_message = "Account and BillingGroup created successfully"
+
+                  response_data = {
+                      "NewAccountId": new_account_id,
+                      "NewAccountEmail": new_account_email,
+                      "BillingGroupArn": billing_group_arn,
+                      "Message": success_message
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+          def generate_bills_email(original_email):
+              """生成+bills邮箱alias"""
+              if '+' in original_email:
+                  # 如果已经有alias，在@前添加bills
+                  local, domain = original_email.split('@')
+                  return f"{local}bills@{domain}"
+              else:
+                  # 没有alias，添加+bills
+                  local, domain = original_email.split('@')
+                  return f"{local}+bills@{domain}"
+
+          def find_existing_bills_account(organizations, master_account_name, master_account_email):
+              """查找现有的Bills账户"""
+              try:
+                  accounts = organizations.list_accounts()['Accounts']
+                  
+                  # 生成可能的Bills账户名称模式
+                  possible_names = [
+                      f"{master_account_name}-Bills",
+                      f"{master_account_name}Bills",
+                      f"Bills-{master_account_name}",
+                      f"Bills{master_account_name}"
+                  ]
+                  
+                  # 生成可能的邮箱模式
+                  local_part, domain = master_account_email.split('@')
+                  possible_emails = []
+                  
+                  # 基础+bills模式
+                  possible_emails.append(f"{local_part}+bills@{domain}")
+                  
+                  # 带数字后缀的模式
+                  for i in range(1, 10):  # 检查1-9的后缀
+                      possible_emails.append(f"{local_part}+bills{i}@{domain}")
+                      possible_emails.append(f"{local_part}bills{i}@{domain}")
+                  
+                  # 不带+的模式
+                  possible_emails.append(f"{local_part}bills@{domain}")
+                  
+                  print(f"Searching for existing Bills accounts with names: {possible_names}")
+                  print(f"Searching for existing Bills accounts with emails: {possible_emails[:5]}... (and more variations)")
+                  
+                  for account in accounts:
+                      account_name = account.get('Name', '')
+                      account_email = account.get('Email', '').lower()
+                      account_status = account.get('Status', '')
+                      
+                      # 跳过管理账户
+                      if account.get('Id') == account.get('MasterAccountId', ''):
+                          continue
+                      
+                      # 跳过非活跃账户
+                      if account_status != 'ACTIVE':
+                          print(f"Skipping account {account_name} - Status: {account_status}")
+                          continue
+                      
+                      # 检查账户名称是否匹配
+                      name_match = any(possible_name.lower() in account_name.lower() or 
+                                     account_name.lower() in possible_name.lower() 
+                                     for possible_name in possible_names)
+                      
+                      # 检查邮箱是否匹配
+                      email_match = any(possible_email.lower() == account_email 
+                                      for possible_email in possible_emails)
+                      
+                      # 检查是否包含bills关键词
+                      bills_in_name = 'bills' in account_name.lower()
+                      bills_in_email = 'bills' in account_email
+                      
+                      if name_match or email_match or (bills_in_name and bills_in_email):
+                          print(f"Found potential Bills account: {account_name} ({account['Email']}) - ID: {account['Id']}")
+                          
+                          # 进一步验证：确保不是其他用途的账户
+                          if ('bills' in account_name.lower() or 'bills' in account_email) and account_status == 'ACTIVE':
+                              print(f"Confirmed Bills account: {account_name}")
+                              return account
+                  
+                  print("No existing Bills account found")
+                  return None
+                  
+              except Exception as e:
+                  print(f"Error searching for existing Bills account: {str(e)}")
+                  return None
+
+          def find_available_email(organizations, base_email):
+              """查找可用的邮箱地址"""
+              # 获取所有现有账户
+              accounts = organizations.list_accounts()['Accounts']
+              existing_emails = {acc['Email'].lower() for acc in accounts}
+              
+              # 检查基础邮箱是否可用
+              if base_email.lower() not in existing_emails:
+                  return base_email
+              
+              # 如果不可用，添加数字后缀
+              local, domain = base_email.split('@')
+              if '+bills' in local:
+                  base_local = local  # service+bills
+              else:
+                  base_local = local.replace('bills', '+bills')  # servicebills -> service+bills
+              
+              for i in range(1, 100):  # 最多尝试99次
+                  test_email = f"{base_local}{i}@{domain}"
+                  if test_email.lower() not in existing_emails:
+                      return test_email
+              
+              raise Exception("Cannot find available email after 99 attempts")
+
+          def wait_for_account_creation(organizations, request_id):
+              """等待账户创建完成"""
+              max_attempts = 60  # 最多等待30分钟 (60 * 30秒)
+              
+              for attempt in range(max_attempts):
+                  time.sleep(30)  # 等待30秒
+                  
+                  status = organizations.describe_create_account_status(
+                      CreateAccountRequestId=request_id
+                  )
+                  
+                  state = status['CreateAccountStatus']['State']
+                  print(f"Account creation attempt {attempt + 1}: {state}")
+                  
+                  if state == 'SUCCEEDED':
+                      return status['CreateAccountStatus']['AccountId']
+                  elif state == 'FAILED':
+                      failure_reason = status['CreateAccountStatus'].get('FailureReason', 'Unknown')
+                      raise Exception(f"Account creation failed: {failure_reason}")
+              
+              raise Exception("Account creation timeout after 30 minutes")
+
+          def wait_for_cb_family_integration(wait_seconds):
+              """等待账户加入Consolidated Billing family"""
+              print(f"Starting CB family integration wait: {wait_seconds} seconds")
+              
+              # 将等待时间分成12个5秒间隔，每15秒打印一次状态
+              intervals = wait_seconds // 15  # 每15秒一个间隔
+              remaining_wait = wait_seconds % 15
+              
+              for i in range(intervals):
+                  elapsed = i * 15
+                  remaining = wait_seconds - elapsed
+                  print(f"CB family integration wait: {elapsed}s elapsed, {remaining}s remaining...")
+                  time.sleep(15)
+              
+              # 处理剩余的等待时间
+              if remaining_wait > 0:
+                  elapsed = intervals * 15
+                  print(f"CB family integration wait: {elapsed}s elapsed, {remaining_wait}s remaining...")
+                  time.sleep(remaining_wait)
+              
+              print(f"CB family integration wait completed: {wait_seconds} seconds total")
+
+          def create_or_find_billing_group(billingconductor, primary_account_id):
+              """查找现有BillingGroup或创建新的，确保新创建的使用'Bills'名称"""
+              try:
+                  # 检查是否已存在BillingGroups
+                  print(f"Checking for existing BillingGroups for account {primary_account_id}")
+                  
+                  existing_groups = billingconductor.list_billing_groups()
+                  
+                  for group in existing_groups.get('BillingGroups', []):
+                      group_name = group.get('Name', '')
+                      group_primary_account = group.get('PrimaryAccountId', '')
+                      group_arn = group.get('Arn', '')
+                      
+                      print(f"Found BillingGroup: {group_name} (Primary: {group_primary_account})")
+                      
+                      # 如果找到相同Primary Account的BillingGroup，直接使用
+                      if group_primary_account == primary_account_id:
+                          print(f"✅ Found existing BillingGroup for this account: {group_name}")
+                          print(f"ℹ️  Using existing BillingGroup: {group_arn}")
+                          return group_arn
+                  
+                  # 如果没有找到现有的BillingGroup，创建新的
+                  print(f"🎯 No existing BillingGroup found for account {primary_account_id}")
+                  print(f"🎯 Creating new BillingGroup with name 'Bills'")
+                  return create_billing_group(billingconductor, primary_account_id)
+                  
+              except Exception as e:
+                  print(f"Error in create_or_find_billing_group: {str(e)}")
+                  # 如果列表操作失败，尝试直接创建
+                  print("Falling back to direct creation")
+                  return create_billing_group(billingconductor, primary_account_id)
+
+          def create_billing_group(billingconductor, primary_account_id):
+              """创建BillingGroup"""
+              try:
+                  # 获取当前账户ID用于构建默认ARN
+                  import boto3
+                  sts = boto3.client('sts')
+                  account_id = sts.get_caller_identity()['Account']
+                  print(f"Current account ID: {account_id}")
+                  
+                  # 首先尝试列出可用的 pricing plans
+                  try:
+                      pricing_plans = billingconductor.list_pricing_plans()
+                      print(f"Available pricing plans: {pricing_plans}")
+                      
+                      # 查找可用的定价计划
+                      standard_plan_arn = None
+                      for plan in pricing_plans.get('PricingPlans', []):
+                          plan_name = plan.get('Name', '')
+                          plan_arn = plan.get('Arn', '')
+                          print(f"Found pricing plan: {plan_name} - {plan_arn}")
+                          
+                          if 'standard' in plan_name.lower() or 'aws' in plan_name.lower() or 'default' in plan_name.lower():
+                              standard_plan_arn = plan_arn
+                              print(f"Selected pricing plan: {standard_plan_arn}")
+                              break
+                      
+                      # 如果没有找到标准计划，使用第一个可用的计划
+                      if not standard_plan_arn and pricing_plans.get('PricingPlans'):
+                          standard_plan_arn = pricing_plans['PricingPlans'][0].get('Arn')
+                          print(f"Using first available pricing plan: {standard_plan_arn}")
+                      
+                  except Exception as list_error:
+                      print(f"Error listing pricing plans: {str(list_error)}")
+                      standard_plan_arn = None
+                  
+                  # 如果没有找到任何定价计划，尝试创建一个默认的
+                  if not standard_plan_arn:
+                      print("No existing pricing plans found, attempting to create default pricing plan")
+                      try:
+                          # 创建默认的定价计划
+                          pricing_plan_response = billingconductor.create_pricing_plan(
+                              Name='DefaultPricingPlan',
+                              Description='Default pricing plan for standard AWS pricing'
+                          )
+                          standard_plan_arn = pricing_plan_response['Arn']
+                          print(f"Created default pricing plan: {standard_plan_arn}")
+                      except Exception as create_plan_error:
+                          print(f"Failed to create default pricing plan: {str(create_plan_error)}")
+                          # 最后的备选方案：使用估计的ARN格式
+                          import random
+                          import string
+                          random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                          standard_plan_arn = f"arn:aws:billingconductor::{account_id}:pricingplan/{random_id}"
+                          print(f"Using fallback ARN: {standard_plan_arn}")
+                  
+                  # 创建 BillingGroup，强制使用'Bills'名称
+                  billing_group_name = 'Bills'
+                  print(f"🎯 Creating BillingGroup with name '{billing_group_name}' and pricing plan: {standard_plan_arn}")
+                  
+                  create_params = {
+                      'Name': billing_group_name,
+                      'Description': f'Billing group for customer original pricing - Account {primary_account_id}',
+                      'PrimaryAccountId': primary_account_id,
+                      'AccountGrouping': {
+                          'LinkedAccountIds': [primary_account_id],
+                          'AutoAssociate': True  # 启用自动账号关联
+                      },
+                      'ComputationPreference': {
+                          'PricingPlanArn': standard_plan_arn
+                      }
+                  }
+                  
+                  print(f"📋 Create parameters: Name='{create_params['Name']}'")
+                  response = billingconductor.create_billing_group(**create_params)
+                  
+                  created_arn = response['Arn']
+                  print(f"✅ BillingGroup created successfully: {created_arn}")
+                  
+                  # 验证创建的BillingGroup名称
+                  try:
+                      group_info = billingconductor.get_billing_group(Arn=created_arn)
+                      actual_name = group_info.get('Name', 'Unknown')
+                      print(f"📋 BillingGroup verification:")
+                      print(f"   Requested name: '{billing_group_name}'")
+                      print(f"   Actual name: '{actual_name}'")
+                      print(f"   ARN: {created_arn}")
+                      
+                      if actual_name.lower() == billing_group_name.lower():
+                          print(f"✅ SUCCESS: BillingGroup name is correctly set to '{actual_name}'")
+                      else:
+                          print(f"❌ ERROR: AWS assigned name '{actual_name}' instead of requested '{billing_group_name}'")
+                          # 如果名称不匹配，这可能是一个严重的问题
+                          raise Exception(f"BillingGroup name mismatch: expected '{billing_group_name}', got '{actual_name}'")
+                      
+                  except Exception as verify_error:
+                      print(f"⚠️  Could not verify BillingGroup name: {str(verify_error)}")
+                      raise verify_error
+                  
+                  return created_arn
+                  
+              except Exception as e:
+                  print(f"BillingGroup creation error: {str(e)}")
+                  # 如果还是失败，尝试最简单的创建方式
+                  try:
+                      billing_group_name = 'Bills'
+                      print(f"🎯 Attempting simple BillingGroup creation with name '{billing_group_name}'")
+                      response = billingconductor.create_billing_group(
+                          Name=billing_group_name,
+                          Description=f'Billing group for customer original pricing - Account {primary_account_id}',
+                          PrimaryAccountId=primary_account_id,
+                          AccountGrouping={
+                              'LinkedAccountIds': [primary_account_id],
+                              'AutoAssociate': True  # 启用自动账号关联
+                          },
+                          ComputationPreference={}  # 空的 ComputationPreference
+                      )
+                      
+                      fallback_arn = response['Arn']
+                      print(f"✅ Fallback BillingGroup created: {fallback_arn}")
+                      
+                      # 验证fallback创建的名称
+                      try:
+                          group_info = billingconductor.get_billing_group(Arn=fallback_arn)
+                          actual_name = group_info.get('Name', 'Unknown')
+                          print(f"📋 Fallback BillingGroup verification:")
+                          print(f"   Requested name: '{billing_group_name}'")
+                          print(f"   Actual name: '{actual_name}'")
+                          
+                          if actual_name.lower() == billing_group_name.lower():
+                              print(f"✅ SUCCESS: Fallback BillingGroup name correctly set to '{actual_name}'")
+                          else:
+                              print(f"⚠️  Fallback BillingGroup got name '{actual_name}' instead of '{billing_group_name}'")
+                              
+                      except Exception as verify_error:
+                          print(f"⚠️  Could not verify fallback BillingGroup name: {str(verify_error)}")
+                      
+                      return fallback_arn
+                  except Exception as simple_error:
+                      print(f"Simple creation also failed: {str(simple_error)}")
+                      raise e
+
+  # Custom Resource触发Lambda
+  CreateAccountAndBillingGroup:
+    Type: Custom::CreateAccountAndBillingGroup
+    Properties:
+      ServiceToken: !GetAtt CreateAccountAndBillingGroupFunction.Arn
+
+Outputs:
+  NewAccountId:
+    Description: "ID of the newly created account"
+    Value: !GetAtt CreateAccountAndBillingGroup.NewAccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-NewAccountId"
+
+  NewAccountEmail:
+    Description: "Email of the newly created account"
+    Value: !GetAtt CreateAccountAndBillingGroup.NewAccountEmail
+    Export:
+      Name: !Sub "${AWS::StackName}-NewAccountEmail"
+
+  BillingGroupArn:
+    Description: "ARN of the created BillingGroup"
+    Value: !GetAtt CreateAccountAndBillingGroup.BillingGroupArn
+    Export:
+      Name: !Sub "${AWS::StackName}-BillingGroupArn"

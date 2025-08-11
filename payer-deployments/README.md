@@ -57,33 +57,73 @@ payer-deployments/
 
 ## 🔄 版本管理系统 (2025-07-24新增)
 
-基于Elite-new11部署经验建立的版本管理系统，解决关键部署问题：
+基于Elite-new11/new12部署经验建立的版本管理系统，解决关键部署问题：
 
 ### 🎯 核心优势
-- **稳定可靠**: v1版本经过Elite-new11生产验证，100%避免已知问题
-- **向后兼容**: 现有脚本自动使用稳定版本，无需修改
+- **稳定可靠**: v1.5版本经过Elite-new12生产验证，100%修复关键问题
+- **向后兼容**: 现有脚本自动使用最新稳定版本，无需修改
 - **智能管理**: 版本管理CLI工具提供完整的版本控制功能
-- **问题预防**: Module 5和6的关键问题已在v1版本中修复
+- **问题预防**: Module 5 Athena Setup IAM角色传播问题已在v1.5版本中修复
 
-### 🚀 快速开始
+### 🚀 快速开始（顺序部署）
 ```bash
-# 推荐：使用版本管理脚本
+# ⚠️ 重要：不使用deploy-all自动化，必须按模块顺序手动部署
 cd ../aws-payer-automation
-./deployment-scripts/version-management.sh deploy-all v1 <payer-name>
 
-# 传统方式：自动使用v1稳定版本
-./scripts/deploy-payer.sh <payer-name>
-
-# 查看版本信息
+# 1. 查看版本信息
 ./deployment-scripts/version-management.sh list-versions
+
+# 2. 按顺序部署每个模块（示例）：
+./deployment-scripts/version-management.sh deploy 01-ou-scp v1.5 <stack-name>
+# 等待CREATE_COMPLETE后继续
+./deployment-scripts/version-management.sh deploy 02-billing-conductor v1.5 <stack-name>
+# 等待CREATE_COMPLETE后继续
+# ...以此类推
+
+# 3. 监控单个栈状态
+aws cloudformation describe-stacks --stack-name <stack-name> --query 'Stacks[0].StackStatus'
+```
+
+## 🚨 关键部署原则
+
+### ⚠️ 顺序部署要求（必须严格遵守）
+
+1. **绝对禁止并行部署**: 不得同时运行多个模块的CloudFormation栈
+2. **严格按序执行**: 必须按Module 1→2→3→4→5→6→7→8的固定顺序
+3. **等待完成验证**: 每个模块必须达到CREATE_COMPLETE状态才能开始下一个  
+4. **失败立即停止**: 任何模块失败时必须立即停止部署流程
+5. **错误分析必须**: 失败时必须分析CloudFormation事件找出根本原因
+6. **不得跳过模块**: 禁止跳过失败的模块继续后续部署
+
+### 📋 正确的部署流程
+```
+Module 1 部署 → 等待CREATE_COMPLETE → 验证成功 ✅
+    ↓
+Module 2 部署 → 等待CREATE_COMPLETE → 验证成功 ✅  
+    ↓
+Module 3 部署 → 等待CREATE_COMPLETE → 验证成功 ✅
+    ↓
+... 以此类推到Module 8
+```
+
+### ❌ 错误的部署方式
+```
+❌ 同时启动多个模块
+❌ 不等待前一个模块完成就开始下一个  
+❌ 跳过失败的模块继续后续部署
+❌ 不分析失败原因直接重试
+❌ 使用deploy-all等自动化批量部署
 ```
 
 ### 📋 版本状态
 | 版本 | 状态 | 描述 | 推荐 |
 |------|------|------|------|
 | v0 | deprecated | 原始版本，存在已知问题 | ❌ |
-| v1 | stable | Elite-new11验证，所有问题已修复 | ✅ |
-| current | symlink | 自动指向推荐稳定版本 | ✅ |
+| v1 | stable | Elite-new11验证，所有问题已修复 | ⚠️ |
+| v1.3 | stable | Crawler自动调度实装完成 | ✅ |
+| v1.4 | stable | CloudFront监控增强+IAM用户模块 | ✅ |
+| v1.5 | stable | **Athena Setup IAM角色传播修复** | 🌟 |
+| current | symlink | 自动指向v1.5推荐版本 | 🌟 |
 
 ## 详细使用方法
 
@@ -104,44 +144,98 @@ cd ../aws-payer-automation
 
 ### 2. 部署Payer
 
-#### 🌟 推荐方式：版本管理脚本
+#### 🌟 推荐方式：版本管理脚本（按模块顺序部署）
 ```bash
 cd ../aws-payer-automation
 
-# 完整部署（推荐）
-./deployment-scripts/version-management.sh deploy-all v1 payer-001
+# ⚠️ 重要：不使用deploy-all，必须按模块顺序部署
+# 严格按照以下顺序执行，每个模块成功后才进行下一个：
 
-# 部署特定模块
-./deployment-scripts/version-management.sh deploy 05-athena-setup v1 stack-name
+# Module 1: OU和SCP设置
+./deployment-scripts/version-management.sh deploy 01-ou-scp v1.5 payer-<name>-ou-scp
+# 等待Module 1完成并验证成功后，才执行Module 2
+
+# Module 2: BillingConductor（耗时最长，30-45分钟）
+./deployment-scripts/version-management.sh deploy 02-billing-conductor v1.5 payer-<name>-billing-conductor
+# 等待Module 2完成并验证成功后，才执行Module 3
+
+# Module 3: CUR Pro forma
+./deployment-scripts/version-management.sh deploy 03-cur-proforma v1.5 payer-<name>-cur-proforma
+# 等待Module 3完成并验证成功后，才执行Module 4
+
+# Module 4: CUR RISP
+./deployment-scripts/version-management.sh deploy 04-cur-risp v1.5 payer-<name>-cur-risp
+# 等待Module 4完成并验证成功后，才执行Module 5
+
+# Module 5: Athena Setup（包含IAM修复）
+./deployment-scripts/version-management.sh deploy 05-athena-setup v1.5 payer-<name>-athena-setup
+# 等待Module 5完成并验证成功后，才执行Module 6
+
+# Module 6: 账户自动管理
+./deployment-scripts/version-management.sh deploy 06-account-auto-management v1.5 payer-<name>-account-auto-management
+# 等待Module 6完成并验证成功后，才执行Module 7
+
+# Module 7: CloudFront监控
+./deployment-scripts/version-management.sh deploy 07-cloudfront-monitoring v1.5 payer-<name>-cloudfront-monitoring
+# 等待Module 7完成并验证成功后，才执行Module 8
+
+# Module 8: IAM用户初始化
+./deployment-scripts/version-management.sh deploy 08-iam-users v1.5 payer-<name>-iam-users
 
 # 查看版本信息
 ./deployment-scripts/version-management.sh list-versions
-./deployment-scripts/version-management.sh version-info v1
+./deployment-scripts/version-management.sh version-info v1.5
 ```
 
-#### 🔄 传统方式：自动使用v1版本
+#### 🔄 传统方式：使用CloudFormation命令逐个部署
 ```bash
 cd payer-deployments
 
-# 完整部署（现在自动使用v1稳定版本）
-./scripts/deploy-payer.sh payer-001
+# ⚠️ 重要：必须按模块顺序手动部署，不使用自动化脚本
+# 严格按照以下顺序执行，每个模块成功后才进行下一个：
 
-# 模拟运行（测试）
-./scripts/deploy-payer.sh payer-001 --dry-run
+# 1. 环境检查和准备
+./scripts/pre-deployment-check.sh
 
-# 部署特定模块
-./scripts/deploy-payer.sh payer-001 --module 05-athena-setup
+# 2. 获取部署命令（但不自动执行）
+./scripts/start-deployment.sh <payer-name> --commands-only
 
-# 查看帮助
-./scripts/deploy-payer.sh --help
+# 3. 手动按顺序执行每个模块的CloudFormation命令：
+# Module 1 → 等待CREATE_COMPLETE → Module 2 → 等待CREATE_COMPLETE → ...
+
+# 示例部署顺序（使用aws cloudformation create-stack）：
+# 1. aws cloudformation create-stack --stack-name payer-<name>-ou-scp ...
+# 2. aws cloudformation create-stack --stack-name payer-<name>-billing-conductor ...
+# 3. aws cloudformation create-stack --stack-name payer-<name>-cur-proforma ...
+# 4. aws cloudformation create-stack --stack-name payer-<name>-cur-risp ...
+# 5. aws cloudformation create-stack --stack-name payer-<name>-athena-setup ...
+# 6. aws cloudformation create-stack --stack-name payer-<name>-account-auto-management ...
+# 7. aws cloudformation create-stack --stack-name payer-<name>-cloudfront-monitoring ...
+# 8. aws cloudformation create-stack --stack-name payer-<name>-iam-users ...
+
+# 监控单个栈状态
+aws cloudformation describe-stacks --stack-name <stack-name>
+
+# 查看栈事件（如有错误）
+aws cloudformation describe-stack-events --stack-name <stack-name>
 ```
 
-### 3. 监控部署进度
+### 3. 监控部署进度（按模块顺序）
 ```bash
-# 查看当前状态
-./scripts/monitor-deployment.sh payer-001
+# 监控当前正在部署的模块
+aws cloudformation describe-stacks --stack-name <当前模块stack-name> --query 'Stacks[0].StackStatus'
 
-# 实时监控日志
+# 实时监控栈事件（发现错误时使用）
+aws cloudformation describe-stack-events --stack-name <stack-name> | head -20
+
+# 等待栈完成部署
+aws cloudformation wait stack-create-complete --stack-name <stack-name>
+
+# 验证栈部署成功后再进行下一个模块
+aws cloudformation describe-stacks --stack-name <stack-name> --query 'Stacks[0].StackStatus' | grep "CREATE_COMPLETE"
+
+# 传统监控方式
+./scripts/monitor-deployment.sh payer-001
 ./scripts/monitor-deployment.sh payer-001 logs
 ```
 
@@ -235,18 +329,23 @@ cd payer-deployments
 部署要求:
 - Payer名称: <payer-name>
 - 账户类型: [新账户/现有账户]
-- 模板版本: v1 (推荐，Elite-new11验证通过)
+- 模板版本: v1.5 (推荐，Elite-new12验证通过，包含关键修复)
 - 特殊要求: [如有任何特殊配置需求]
 
 请按照以下步骤执行:
 1. 运行环境检查脚本
-2. 使用v1稳定版本模板
+2. 使用v1.5稳定版本模板（包含Athena Setup IAM修复）
 3. 生成标准化部署命令（优先使用版本管理脚本）
-4. 逐个执行所有模块的部署
-5. 在每个模块完成后进行验证
-6. 记录部署日志和进度
+4. **按顺序逐个部署模块（严禁并行部署）**:
+   - 部署Module 1 → 等待完成并验证 → 继续下一个
+   - 部署Module 2 → 等待完成并验证 → 继续下一个
+   - 以此类推，每个模块必须成功后才进行下一个
+5. **错误处理**: 如任何模块失败，立即停止部署
+6. **调查失败原因**: 分析错误日志，提供解决方案
+7. **中断部署流程**: 不得跳过失败模块继续后续部署
+8. 记录详细部署日志和进度状态
 
-如果遇到任何错误,请停下来告诉我并提供解决方案。
+⚠️ **重要提醒**: 绝对不允许同时部署多个模块或跳过失败的模块。必须按Module 1→2→3→4→5→6→7→8的严格顺序执行。
 ```
 
 #### 2. 部署问题排查请求
@@ -321,12 +420,16 @@ Claude Code在接到部署请求后会自动执行以下工作流程:
 
 ### 部署过程中的重要提醒
 
-- **权限要求**: 确保AWS凭证具有完整的管理员权限
-- **区域设置**: 必须在us-east-1区域进行部署
-- **等待时间**: Module 2 (BillingConductor)需要30-45分钟
-- **错误处理**: 遇到错误时不要跳过,必须解决后继续
-- **Organizations**: 如果是独立账户会自动创建Organizations
-- **BillingGroup名称**: 新创建的BillingGroup会使用"Bills"作为名称
+- **🚨 顺序部署**: 绝对不允许并行部署多个模块，必须严格按Module 1→2→3→4→5→6→7→8顺序
+- **⏳ 等待验证**: 每个模块必须达到CREATE_COMPLETE状态后才能开始下一个
+- **❌ 错误停止**: 任何模块失败时立即停止，不得跳过继续后续模块
+- **🔍 故障分析**: 模块失败时必须分析CloudFormation事件日志找出根本原因
+- **⚠️ 关键模块**: Module 2 (BillingConductor)耗时最长(30-45分钟)，Module 5包含IAM修复
+- **🌍 区域设置**: 必须在us-east-1区域进行部署
+- **🔑 权限要求**: 确保AWS凭证具有完整的管理员权限
+- **🏢 Organizations**: 如果是独立账户会自动创建Organizations
+- **💰 BillingGroup名称**: 新创建的BillingGroup会使用"Bills"作为名称
+- **📋 状态监控**: 使用`aws cloudformation describe-stacks`持续监控当前模块状态
 
 ### 常用的Claude Code指令
 
@@ -334,8 +437,8 @@ Claude Code在接到部署请求后会自动执行以下工作流程:
 # 让Claude Code检查环境
 请运行 ./scripts/pre-deployment-check.sh 并告诉我结果
 
-# 让Claude Code使用版本管理系统开始部署
-请为 <payer-name> 使用v1版本运行标准化部署流程，优先使用版本管理脚本
+# 让Claude Code按顺序部署模块
+请为 <payer-name> 使用v1.5版本按模块顺序部署，严格按Module 1→2→3→4→5→6→7→8顺序，每个成功后再进行下一个
 
 # 让Claude Code检查版本信息
 请运行版本管理脚本查看可用版本：./deployment-scripts/version-management.sh list-versions
@@ -343,8 +446,8 @@ Claude Code在接到部署请求后会自动执行以下工作流程:
 # 让Claude Code检查栈状态  
 请检查所有CloudFormation栈的当前状态
 
-# 让Claude Code修复问题（现在问题更少了）
-<payer-name> 的Module X部署失败,错误是: [错误信息], 请帮助修复
+# 让Claude Code修复问题并中断部署
+<payer-name> 的Module X部署失败,错误是: [错误信息], 请立即停止部署并分析失败原因，不要继续后续模块
 
 # 让Claude Code生成报告
 请为 <payer-name> 生成完整的部署状态报告
@@ -368,13 +471,13 @@ Claude Code在接到部署请求后会自动执行以下工作流程:
   - 最佳实践建议
 
 - **[PRODUCTION-DEPLOYMENT-GUIDE.md](./PRODUCTION-DEPLOYMENT-GUIDE.md)**: 生产环境标准部署流程
-  - 手动部署步骤（已更新使用v1版本）
+  - 手动部署步骤（已更新使用v1.5版本）
   - 环境验证清单
-  - Elite-new11修复经验
+  - Elite-new11/new12修复经验
 
 - **[TROUBLESHOOTING-GUIDE.md](./TROUBLESHOOTING-GUIDE.md)** 🆕: 故障排除指南
-  - 基于Elite-new11经验的问题解决方案
-  - 常见错误分类和修复方法
+  - 基于Elite-new11/new12经验的问题解决方案
+  - 常见错误分类和修复方法（包含v1.5修复）
   - 高级诊断技巧
   - 紧急修复流程
 
