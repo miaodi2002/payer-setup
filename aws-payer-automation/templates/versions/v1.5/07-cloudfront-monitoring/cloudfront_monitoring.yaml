@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "CloudFront traffic monitoring with intelligent OAM setup across multiple accounts"
+
+Parameters:
+  PayerName:
+    Type: String
+    Description: "Name of the Payer (use Master Account name from AWS Organizations)"
+    
+  PayerAccountId:
+    Type: String
+    Description: "Master Account ID for this Payer"
+    
+  CloudFrontThresholdMB:
+    Type: Number
+    Default: 5120
+    Description: "CloudFront traffic threshold in MB (15-minute window) - Default: 5GB"
+    
+  TelegramGroupId:
+    Type: String
+    Default: "-862835857"
+    Description: "Telegram group ID for notifications"
+    
+  TelegramApiEndpoint:
+    Type: String
+    Default: "http://3.112.108.101:8509/api/sendout"
+    Description: "Telegram Bot API endpoint"
+
+Resources:
+  # OAM Sink for centralized monitoring in Payer account
+  MonitoringSink:
+    Type: AWS::Oam::Sink
+    Properties:
+      Name: !Sub "${PayerName}-monitoring-sink"
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - "oam:CreateLink"
+              - "oam:UpdateLink"
+            Resource: "*"
+            Condition:
+              ForAllValues:StringEquals:
+                oam:ResourceTypes:
+                  - "AWS::CloudWatch::Metric"
+                  - "AWS::Logs::LogGroup"
+                  - "AWS::XRay::Trace"
+                  - "AWS::ApplicationInsights::Application"
+                  - "AWS::InternetMonitor::Monitor"
+
+
+  # SNS Topic for CloudFront traffic alerts
+  CloudFrontAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${PayerName}-CloudFront-Traffic-Alerts"
+      DisplayName: !Sub "${PayerName} CloudFront Traffic Monitoring"
+
+  # IAM Role for CloudFront Alert Lambda
+  CloudFrontAlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PayerName}-CloudFrontAlertRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: "*"
+
+  # Lambda function for CloudFront traffic alerts
+  CloudFrontAlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${PayerName}-CloudFront-Alert"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CloudFrontAlertRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          PAYER_NAME: !Ref PayerName
+          PAYER_ACCOUNT_ID: !Ref PayerAccountId
+          TELEGRAM_GROUP_ID: !Ref TelegramGroupId
+          TELEGRAM_API_ENDPOINT: !Ref TelegramApiEndpoint
+          THRESHOLD_MB: !Ref CloudFrontThresholdMB
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime, timedelta
+          import os
+          
+          def lambda_handler(event, context):
+              print(f"Received CloudWatch alarm event: {json.dumps(event)}")
+              
+              for record in event['Records']:
+                  sns_message = record['Sns']['Message']
+                  message = json.loads(sns_message)
+                  
+                  # Extract alarm information
+                  alarm_name = message['AlarmName']
+                  new_state = message['NewStateValue']
+                  reason = message['NewStateReason']
+                  region = message['Region']
+                  
+                  print(f"Processing alarm: {alarm_name}, State: {new_state}")
+                  
+                  if new_state == 'ALARM':
+                      # Find high usage accounts
+                      high_usage_accounts = find_high_usage_accounts()
+                      
+                      # Send Telegram alert
+                      send_cloudfront_alert(alarm_name, high_usage_accounts, message)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Success')
+              }
+          
+          def find_high_usage_accounts():
+              cloudwatch = boto3.client('cloudwatch')
+              organizations = boto3.client('organizations')
+              threshold_mb = int(os.environ['THRESHOLD_MB'])
+              threshold_bytes = threshold_mb * 1024 * 1024
+              
+              # 动态获取所有活跃的成员账户
+              try:
+                  # 获取Master Account ID
+                  org_info = organizations.describe_organization()
+                  master_account_id = org_info['Organization']['MasterAccountId']
+                  
+                  # 获取所有活跃账户，排除Master Account
+                  accounts = organizations.list_accounts()
+                  member_accounts = [
+                      account['Id'] 
+                      for account in accounts['Accounts'] 
+                      if account['Status'] == 'ACTIVE' and account['Id'] != master_account_id
+                  ]
+                  
+                  print(f"Found {len(member_accounts)} active member accounts to check")
+                  
+              except Exception as e:
+                  print(f"Error getting member accounts: {str(e)}")
+                  return []
+              
+              high_usage = []
+              
+              for account_id in member_accounts:
+                  if not account_id:
+                      continue
+                  
+                  try:
+                      # Query CloudFront BytesDownloaded for specific account
+                      response = cloudwatch.get_metric_data(
+                          MetricDataQueries=[{
+                              'Id': f"cloudfront_{account_id.replace('-', '_')}",
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/CloudFront',
+                                      'MetricName': 'BytesDownloaded'
+                                  },
+                                  'Period': 900,  # 15 minutes
+                                  'Stat': 'Sum'
+                              },
+                              'ReturnData': True
+                          }],
+                          StartTime=datetime.now() - timedelta(minutes=15),
+                          EndTime=datetime.now()
+                      )
+                      
+                      if response['MetricDataResults'] and response['MetricDataResults'][0]['Values']:
+                          total_bytes = sum(response['MetricDataResults'][0]['Values'])
+                          total_mb = round(total_bytes / 1024.0 / 1024.0, 2)
+                          
+                          if total_bytes > threshold_bytes:
+                              high_usage.append({
+                                  'account_id': account_id,
+                                  'usage_mb': total_mb,
+                                  'usage_bytes': total_bytes
+                              })
+                      
+                  except Exception as e:
+                      print(f"Error querying account {account_id}: {str(e)}")
+              
+              # Sort by usage descending
+              return sorted(high_usage, key=lambda x: x['usage_mb'], reverse=True)
+          
+          def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details):
+              payer_name = os.environ['PAYER_NAME']
+              payer_account_id = os.environ['PAYER_ACCOUNT_ID']
+              threshold_mb = os.environ['THRESHOLD_MB']
+              
+              # Build formatted message with Payer name and ID
+              payer_display = f"{payer_name}({payer_account_id})"
+              message = build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
+              
+              # Send to Telegram
+              send_telegram_message(message)
+          
+          def build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details):
+              timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+              
+              message = f"🚨 CloudFront流量告警 - {payer_display}\n\n"
+              
+              if high_usage_accounts:
+                  message += "📊 超量账户详情:\n"
+                  message += "┌─────────────────────────\n"
+                  
+                  for index, account in enumerate(high_usage_accounts[:5]):
+                      percentage = round((account['usage_mb'] / float(threshold_mb) - 1) * 100, 1)
+                      message += f"│ {index + 1}. 账户: {account['account_id']}\n"
+                      message += f"│    用量: {account['usage_mb']} MB\n"
+                      message += f"│    超出: +{percentage}%\n"
+                      if index < len(high_usage_accounts[:5]) - 1:
+                          message += "├─────────────────────────\n"
+                  
+                  message += "└─────────────────────────\n\n"
+                  
+                  if len(high_usage_accounts) > 5:
+                      message += f"📋 另有 {len(high_usage_accounts) - 5} 个账户超限\n\n"
+              else:
+                  message += "📊 正在分析具体超量账户...\n\n"
+              
+              message += "📈 告警信息:\n"
+              message += f"• 告警名称: {alarm_name}\n"
+              message += f"• 设定阈值: {threshold_mb} MB\n"
+              message += "• 监控周期: 15分钟\n"
+              message += f"• 告警时间: {timestamp}\n\n"
+              
+              message += "⚠️ 建议立即检查CloudFront使用情况\n\n"
+              
+              message += "🔗 快速链接:\n"
+              message += "• CloudFront: https://console.aws.amazon.com/cloudfront\n"
+              message += "• CloudWatch: https://console.aws.amazon.com/cloudwatch"
+              
+              return message
+          
+          def send_telegram_message(message):
+              try:
+                  url = os.environ['TELEGRAM_API_ENDPOINT']
+                  data = urllib.parse.urlencode({
+                      'group': os.environ['TELEGRAM_GROUP_ID'],
+                      'message': message
+                  }).encode('utf-8')
+                  
+                  req = urllib.request.Request(url, data=data, method='POST')
+                  req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+                  
+                  with urllib.request.urlopen(req) as response:
+                      response_body = response.read().decode('utf-8')
+                      print(f"Telegram API Response: {response.status} - {response_body}")
+                  
+              except Exception as e:
+                  print(f"Failed to send Telegram message: {str(e)}")
+
+  # CloudWatch Alarm for CloudFront traffic monitoring
+  CloudFrontTrafficAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${PayerName}_CloudFront_Cross_Account_Traffic"
+      AlarmDescription: !Sub "Monitor CloudFront traffic across all ${PayerName} member accounts"
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref CloudFrontAlarmTopic
+      OKActions: []
+      InsufficientDataActions: []
+      Dimensions: []
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref CloudFrontThresholdMB
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      Metrics:
+        - Id: "total_cloudfront_bytes"
+          ReturnData: false
+          Expression: 'SELECT SUM(BytesDownloaded) FROM SCHEMA("AWS/CloudFront", DistributionId,Region)'
+          Period: 900
+        - Id: "total_cloudfront_mb"
+          Label: !Sub "${PayerName}_CloudFront_15min_Total_MB"
+          ReturnData: true
+          Expression: "total_cloudfront_bytes / 1048576"
+
+  # Lambda permission for SNS to invoke CloudFront alert function
+  CloudFrontAlertPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CloudFrontAlertFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CloudFrontAlarmTopic
+
+  # SNS subscription to trigger Lambda
+  CloudFrontAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CloudFrontAlarmTopic
+      Endpoint: !GetAtt CloudFrontAlertFunction.Arn
+
+Outputs:
+  MonitoringSinkArn:
+    Description: "ARN of the OAM Sink for centralized monitoring"
+    Value: !GetAtt MonitoringSink.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoringSink"
+      
+  CloudFrontAlarmName:
+    Description: "Name of the CloudFront traffic alarm"
+    Value: !Ref CloudFrontTrafficAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontAlarm"
+      
+  AlertFunctionArn:
+    Description: "ARN of the CloudFront alert Lambda function"
+    Value: !GetAtt CloudFrontAlertFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertFunction"
+      
+  PayerName:
+    Description: "Name of the Payer being monitored"
+    Value: !Ref PayerName
+    Export:
+      Name: !Sub "${AWS::StackName}-PayerName"
+      
+  ThresholdMB:
+    Description: "CloudFront traffic threshold in MB"
+    Value: !Ref CloudFrontThresholdMB
+    Export:
+      Name: !Sub "${AWS::StackName}-Threshold"

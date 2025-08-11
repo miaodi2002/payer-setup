@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: "Setup Athena environment for CUR data analysis - FIXED VERSION with IAM role propagation wait"
+Description: "Setup Athena environment for CUR data analysis - FIXED VERSION with simplified Lambda"
 
 Parameters:
   ProformaBucketName:
@@ -56,21 +56,20 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
 
-  # 修复的Lambda函数：添加IAM角色传播等待时间
+  # 简化的Lambda函数：只创建基础Athena环境
   CreateAthenaEnvironmentFunction:
     Type: AWS::Lambda::Function
     Properties:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 600  # 增加到10分钟
+      Timeout: 300
       Code:
         ZipFile: |
           import json
           import boto3
           import cfnresponse
           import uuid
-          import time
 
           def lambda_handler(event, context):
               try:
@@ -100,27 +99,24 @@ Resources:
                   create_glue_database(glue, proforma_database_name, "Pro forma CUR data")
                   create_glue_database(glue, risp_database_name, "RISP CUR data")
 
-                  # 2. 创建Crawler角色（带等待时间）
-                  role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
+                  # 2. 创建Crawler IAM角色
+                  crawler_role_arn = create_crawler_role(iam, account_id, proforma_bucket, risp_bucket)
 
-                  # 3. 等待角色传播完成（关键修复）
-                  print("Waiting for IAM role propagation...")
-                  time.sleep(30)  # 等待30秒让IAM角色完全传播
-                  print("IAM role propagation wait completed")
-
-                  # 4. 创建两个Crawler
+                  # 3. 创建Glue Crawlers
                   proforma_crawler_name = f"AWSCURCrawler-{account_id}"
-                  risp_crawler_name = f"AWSCURCrawler-RISP-{account_id}"
+                  risp_crawler_name = f"AWSRISPCURCrawler-{account_id}"
                   
-                  create_glue_crawler(glue, proforma_crawler_name, proforma_database_name, role_arn, proforma_bucket, proforma_report)
-                  create_glue_crawler(glue, risp_crawler_name, risp_database_name, role_arn, risp_bucket, risp_report)
+                  create_glue_crawler(glue, proforma_crawler_name, proforma_database_name, 
+                                    crawler_role_arn, proforma_bucket, proforma_report)
+                  create_glue_crawler(glue, risp_crawler_name, risp_database_name, 
+                                    crawler_role_arn, risp_bucket, risp_report)
 
-                  # 5. 启动Crawlers (可选，注释掉避免初次运行错误)
-                  # start_crawlers(glue, proforma_crawler_name, risp_crawler_name)
+                  # 4. 启动初始爬取
+                  start_crawlers(glue, proforma_crawler_name, risp_crawler_name)
 
                   response_data = {
-                      "ProformaDatabase": proforma_database_name,
-                      "RISPDatabase": risp_database_name,
+                      "ProformaDatabaseName": proforma_database_name,
+                      "RISPDatabaseName": risp_database_name,
                       "ProformaCrawlerName": proforma_crawler_name,
                       "RISPCrawlerName": risp_crawler_name,
                       "Message": "Athena environment created successfully"
@@ -214,7 +210,6 @@ Resources:
                       pass
 
                   s3_path = f"s3://{bucket_name}/daily/{report_name}/"
-                  print(f"Creating crawler {crawler_name} for path: {s3_path}")
 
                   glue.create_crawler(
                       Name=crawler_name,
@@ -239,7 +234,15 @@ Resources:
                   print(f"Crawler creation error: {str(e)}")
                   raise
 
-  # 自定义资源
+          def start_crawlers(glue, proforma_crawler_name, risp_crawler_name):
+              for crawler_name in [proforma_crawler_name, risp_crawler_name]:
+                  try:
+                      glue.start_crawler(Name=crawler_name)
+                      print(f"Started crawler: {crawler_name}")
+                  except Exception as e:
+                      print(f"Start crawler error for {crawler_name}: {str(e)}")
+
+  # Custom Resource触发Lambda
   CreateAthenaEnvironment:
     Type: Custom::CreateAthenaEnvironment
     Properties:
@@ -250,18 +253,26 @@ Resources:
       RISPReportName: !Ref RISPReportName
 
 Outputs:
-  ProformaDatabase:
-    Description: "Glue Database for Pro forma CUR data"
-    Value: !GetAtt CreateAthenaEnvironment.ProformaDatabase
-    
-  RISPDatabase:
-    Description: "Glue Database for RISP CUR data"
-    Value: !GetAtt CreateAthenaEnvironment.RISPDatabase
-    
+  ProformaDatabaseName:
+    Description: "Glue database name for Pro forma CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.ProformaDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaDatabaseName"
+
+  RISPDatabaseName:
+    Description: "Glue database name for RISP CUR data"
+    Value: !GetAtt CreateAthenaEnvironment.RISPDatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPDatabaseName"
+
   ProformaCrawlerName:
-    Description: "Glue Crawler for Pro forma data"
+    Description: "Pro forma CUR crawler name"
     Value: !GetAtt CreateAthenaEnvironment.ProformaCrawlerName
-    
+    Export:
+      Name: !Sub "${AWS::StackName}-ProformaCrawlerName"
+
   RISPCrawlerName:
-    Description: "Glue Crawler for RISP data"  
+    Description: "RISP CUR crawler name"
     Value: !GetAtt CreateAthenaEnvironment.RISPCrawlerName
+    Export:
+      Name: !Sub "${AWS::StackName}-RISPCrawlerName"
