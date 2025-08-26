@@ -62,7 +62,8 @@
 - 设置Lambda函数处理自动化数据发现
 - 配置S3事件通知自动触发数据更新
 - 创建状态表跟踪CUR数据生成状态
-- ⚠️ **注意**: 使用简化版模板 `athena_setup_simplified.yaml`
+- ⚠️ **重要**: 使用v1.5修复版 `athena_setup_fixed.yaml`
+- ⚠️ **关键参数**: `ProformaReportName`必须使用主账户ID(如534877455433)，**不要**使用"proforma-534877455433"
 
 ### Module 6: 账户自动移动
 - 监控AWS Organizations事件（CreateAccountResult、AcceptHandshake）
@@ -383,21 +384,27 @@ aws logs filter-log-events \
 6. **Module 5 Lambda内联代码语法错误**
    - 错误信息：`Runtime.UserCodeSyntaxError`
    - 原因：`athena_setup.yaml`中Lambda内联代码语法错误
-   - 解决方案：使用`athena_setup_simplified.yaml`模板
-   - 或者添加必要的IAM PassRole权限
+   - 解决方案：使用v1.5版本`athena_setup_fixed.yaml`模板
 
-7. **Module 6账户移动失败**
+7. **Module 5 Athena无数据问题** ⚠️ **新发现**
+   - 问题：Glue Crawler创建成功但Athena查询无数据
+   - 根因：Pro forma Crawler S3路径配置错误
+   - 错误配置：`s3://bucket/daily/proforma-ACCOUNTID/`
+   - 正确配置：`s3://bucket/daily/ACCOUNTID/` (使用主账户ID)
+   - 解决方案：v1.5版本已修复路径配置和参数验证
+
+8. **Module 6账户移动失败**
    - 问题1：JSON键大小写错误（`Type`应为`type`，`Id`应为`id`）
    - 问题2：AcceptHandshake事件中使用错误的master账户ID字段
    - 解决方案：使用`recipientAccountId`而非`userIdentity.accountId`
    - 状态：✅ 已在`account_auto_move_fixed.yaml`中修复
 
-8. **Module 6部署失败**
+9. **Module 6部署失败**
    - 确认CloudTrail S3存储桶策略正确
    - 检查EventBridge规则创建权限
    - 验证Lambda函数权限
 
-9. **Module 7 StackSet部署失败**
+10. **Module 7 StackSet部署失败**
    - 错误信息：缺少`AWSCloudFormationStackSetAdministrationRole`
    - 解决方案：创建必要的StackSet IAM角色或使用SERVICE_MANAGED权限模型
    - 状态：⚠️ 核心监控功能已部署（80%完成），StackSet集成待完善
