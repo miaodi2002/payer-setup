@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "IAM Users initialization for Payer automation system - Module 8"
+
+Parameters:
+  PayerName:
+    Type: String
+    Description: "Name of the Payer (use Master Account name from AWS Organizations)"
+
+Resources:
+  # IAM User: cost_explorer
+  CostExplorerUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: cost_explorer
+      LoginProfile:
+        Password: "ejGk%$&1"
+        PasswordResetRequired: true
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonAthenaFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AWSBillingConductorFullAccess"
+        - "arn:aws:iam::aws:policy/AWSGlueSchemaRegistryFullAccess"
+        - "arn:aws:iam::aws:policy/AWSOrganizationsReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/IAMFullAccess"
+      Tags:
+        - Key: "PayerName"
+          Value: !Ref PayerName
+        - Key: "Module"
+          Value: "08-iam-users"
+        - Key: "Purpose"
+          Value: "Cost exploration and billing analysis"
+
+  # IAM User: ReadOnly_system
+  ReadOnlySystemUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ReadOnly_system
+      LoginProfile:
+        Password: "Password1!"
+        PasswordResetRequired: true
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+      Tags:
+        - Key: "PayerName"
+          Value: !Ref PayerName
+        - Key: "Module"
+          Value: "08-iam-users"
+        - Key: "Purpose"
+          Value: "Read-only system access"
+
+Outputs:
+  CostExplorerUserName:
+    Description: "Name of the cost explorer IAM user"
+    Value: !Ref CostExplorerUser
+    Export:
+      Name: !Sub "${AWS::StackName}-CostExplorerUser"
+
+  CostExplorerUserArn:
+    Description: "ARN of the cost explorer IAM user"
+    Value: !GetAtt CostExplorerUser.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CostExplorerUserArn"
+
+  ReadOnlySystemUserName:
+    Description: "Name of the read-only system IAM user"
+    Value: !Ref ReadOnlySystemUser
+    Export:
+      Name: !Sub "${AWS::StackName}-ReadOnlySystemUser"
+
+  ReadOnlySystemUserArn:
+    Description: "ARN of the read-only system IAM user"
+    Value: !GetAtt ReadOnlySystemUser.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ReadOnlySystemUserArn"
+
+  PayerName:
+    Description: "Name of the Payer for which users were created"
+    Value: !Ref PayerName
+    Export:
+      Name: !Sub "${AWS::StackName}-PayerName"
+
+  LoginInstructions:
+    Description: "Instructions for first-time login"
+    Value: !Sub |
+      Users created with initial password and password reset required.
+      Console URL: https://${AWS::AccountId}.signin.aws.amazon.com/console
+      Users: cost_explorer, ReadOnly_system
