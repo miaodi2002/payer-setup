@@ -354,11 +354,12 @@
     },
     "v1.5": {
       "status": "stable",
-      "description": "Athena Setup IAM角色传播问题修复版本",
+      "description": "Athena Setup IAM角色传播 + Crawler路径配置修复版本",
       "created": "2025-08-11T15:32:00+09:00",
+      "updated": "2025-08-26T19:30:00+09:00",
       "validation": {
         "deployment": "Elite-new12",
-        "date": "2025-08-11",
+        "date": "2025-08-26",
         "account": "534877455433",
         "status": "success",
         "success_rate": "100%"
@@ -368,16 +369,21 @@
           "payer_name": "Elite-new12",
           "account_id": "534877455433",
           "deployment_date": "2025-08-11",
+          "update_date": "2025-08-26",
           "status": "completed",
           "modules_success": "8/8",
-          "critical_fixes": "athena-setup-iam-role-propagation"
+          "critical_fixes": "athena-setup-iam-role-propagation + crawler-path-configuration"
         }
       ],
       "fixes": [
         "Module 5: 修复IAM角色传播导致的Glue Crawler创建失败",
         "Module 5: 添加30秒IAM角色传播等待时间 (time.sleep(30))",
         "Module 5: 增加Lambda超时时间到600秒(10分钟)",
-        "Module 5: 添加详细日志输出便于调试"
+        "Module 5: 添加详细日志输出便于调试",
+        "Module 5: ⚠️ 修复Pro forma Crawler路径配置错误",
+        "Module 5: 使用账户ID作为S3路径前缀，而非'proforma-账户ID'",
+        "Module 5: 添加Crawler路径自动更新逻辑",
+        "Module 5: 集成每日自动调度功能(cron: 0 2 * * ? *)"
       ],
       "modules": {
         "01-ou-scp": {
@@ -410,22 +416,25 @@
         },
         "05-athena-setup": {
           "templates": [
-            "athena_setup.yaml",
-            "athena_setup_with_scheduler.yaml",
-            "athena_setup_advanced_scheduler.yaml"
+            "athena_setup_fixed.yaml"
           ],
-          "status": "fixed-stable",
-          "notes": "CRITICAL FIX: IAM角色传播问题完全修复",
+          "status": "production-ready",
+          "notes": "⚠️ CRITICAL FIX: IAM角色传播 + Crawler路径配置双重修复",
           "fixes": [
             "修复IAM角色传播等待时间问题",
             "错误'Service is unable to assume provided role'已解决",
             "增加time.sleep(30)等待角色传播",
             "增加Lambda超时到600秒",
-            "添加import time模块"
+            "添加import time模块",
+            "⚠️ 修复Pro forma Crawler S3路径配置错误",
+            "⚠️ ProformaReportName参数应使用账户ID，不是'proforma-账户ID'",
+            "添加Crawler路径自动更新和验证逻辑",
+            "集成每日凌晨2点自动调度"
           ],
-          "validation": "Elite-new12成功创建2个Glue数据库和2个Crawler，IAM角色传播问题完全解决",
-          "before_fix": "多次部署失败，IAM角色传播问题",
-          "after_fix": "100%部署成功率，稳定运行"
+          "validation": "Elite-new12完全验证：数据库创建✅ Crawler创建✅ 数据爬取✅ Athena查询✅",
+          "before_fix": "Crawler路径错误导致Athena无数据",
+          "after_fix": "100%成功率，数据正常显示，自动调度运行",
+          "deployment_note": "⚠️ 部署时ProformaReportName必须使用账户ID(如534877455433)，不要加proforma-前缀"
         },
         "06-account-auto-management": {
           "templates": [
@@ -483,15 +492,19 @@
   "changelog": [
     {
       "version": "v1.5",
-      "date": "2025-08-11",
+      "date": "2025-08-26",
       "changes": [
         "Module 5: CRITICAL FIX - 修复IAM角色传播导致的Glue Crawler创建失败",
         "Module 5: 添加30秒IAM角色传播等待时间，解决'Service is unable to assume provided role'错误",
         "Module 5: Lambda超时时间增加到600秒(10分钟)，确保充足执行时间",
+        "Module 5: ⚠️ CRITICAL FIX - 修复Pro forma Crawler S3路径配置错误",
+        "Module 5: ProformaReportName参数必须使用账户ID(如534877455433)，不要使用'proforma-账户ID'",
+        "Module 5: 添加Crawler路径自动验证和更新逻辑",
+        "Module 5: 集成Crawler每日自动调度功能(凌晨2点UTC)",
         "Module 5: 添加import time模块和详细日志输出",
         "验证: Elite-new12生产环境部署100%成功(8/8模块)",
-        "验证: Glue数据库和Crawler创建完全正常",
-        "基于Elite-new12实际部署经验的关键修复"
+        "验证: Glue数据库和Crawler创建完全正常，Athena数据查询正常",
+        "基于Elite-new12实际部署经验的双重关键修复"
       ]
     },
     {
