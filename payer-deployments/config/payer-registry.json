@@ -41,6 +41,26 @@
         "06-account-auto-management": {"status": "pending", "estimated_time": "25min"},
         "07-cloudfront-monitoring": {"status": "pending", "estimated_time": "15min"}
       }
+    },
+    "Elite-new15": {
+      "name": "Elite-new15",
+      "company": "Elite Corporation",
+      "master_account_email": "admin+elite-new15@elite-corp.com",
+      "contact_person": "系统管理员",
+      "contact_email": "sysadmin@elite-corp.com",
+      "deployment_status": "planned",
+      "priority": "high",
+      "created_date": "2025-11-20",
+      "notes": "实际生产部署 - Elite-new15",
+      "modules": {
+        "01-ou-scp": {"status": "pending", "estimated_time": "30min"},
+        "02-billing-conductor": {"status": "pending", "estimated_time": "50min"},
+        "03-cur-proforma": {"status": "pending", "estimated_time": "20min"},
+        "04-cur-risp": {"status": "pending", "estimated_time": "20min"},
+        "05-athena-setup": {"status": "pending", "estimated_time": "30min"},
+        "06-account-auto-management": {"status": "pending", "estimated_time": "25min"},
+        "07-cloudfront-monitoring": {"status": "pending", "estimated_time": "15min"}
+      }
     }
   },
   "deployment_statistics": {

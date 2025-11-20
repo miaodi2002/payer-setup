@@ -128,7 +128,7 @@ else
 fi
 
 log_info "步骤6: 检查必要的模板文件"
-PROJECT_PATH="/Users/di.miao/Work/payer-setup/aws-payer-automation"
+PROJECT_PATH="/Users/di.miao/Work/BIP/payer-setup/aws-payer-automation"
 REQUIRED_TEMPLATES=(
     "02-billing-conductor/billing_conductor.yaml"
     "03-cur-proforma/cur_export_proforma.yaml"
@@ -191,8 +191,8 @@ export ORGANIZATION_ID="$ORG_ID"
 export MASTER_ACCOUNT_ID="$MASTER_ACCOUNT_ID"
 
 # 项目路径
-export PROJECT_PATH="/Users/di.miao/Work/payer-setup/aws-payer-automation"
-export DEPLOYMENT_PATH="/Users/di.miao/Work/payer-setup/payer-deployments"
+export PROJECT_PATH="/Users/di.miao/Work/BIP/payer-setup/aws-payer-automation"
+export DEPLOYMENT_PATH="/Users/di.miao/Work/BIP/payer-setup/payer-deployments"
 
 # Organizations结构 (需要时可用)
 export ROOT_ID=\$(aws organizations list-roots --query 'Roots[0].Id' --output text 2>/dev/null || echo "")
