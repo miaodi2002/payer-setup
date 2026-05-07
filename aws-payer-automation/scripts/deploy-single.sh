@@ -235,7 +235,7 @@ deploy_module5() {
     
     aws cloudformation create-stack \
         --stack-name "$stack_name" \
-        --template-body file://templates/05-athena-setup/athena_setup.yaml \
+        --template-body file://templates/05-athena-setup/athena_setup_fixed.yaml \
         --parameters \
             ParameterKey=ProformaBucketName,ParameterValue="$proforma_bucket" \
             ParameterKey=RISPBucketName,ParameterValue="$risp_bucket" \
@@ -243,11 +243,11 @@ deploy_module5() {
             ParameterKey=RISPReportName,ParameterValue="$risp_report" \
         --capabilities CAPABILITY_NAMED_IAM \
         --region "$REGION"
-    
+
     wait_for_stack "$stack_name" "create"
-    
-    # Get database name for reference
-    local database_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`DatabaseName`].OutputValue' --output text)
+
+    # Get database name for reference (v1.5 fixed template outputs ProformaDatabaseName)
+    local database_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`ProformaDatabaseName`].OutputValue' --output text)
     
     print_success "Module 5 deployed successfully: $stack_name"
     print_status "Athena Database: $database_name"
@@ -327,70 +327,134 @@ deploy_module6() {
     fi
 }
 
+# Function to enable CloudFormation StackSets trusted access
+# Service-managed StackSets require BOTH:
+#   1. Organizations side: enable-aws-service-access (member.org.stacksets.cloudformation.amazonaws.com)
+#   2. CloudFormation side: activate-organizations-access (missing step causes:
+#      "You must enable organizations access to operate a service managed stack set")
+enable_stacksets_trusted_access() {
+    print_status "Enabling CloudFormation StackSets trusted access with AWS Organizations"
+    local trusted_access
+    trusted_access=$(aws organizations list-aws-service-access-for-organization \
+        --query 'EnabledServicePrincipals[?ServicePrincipal==`member.org.stacksets.cloudformation.amazonaws.com`]' \
+        --output text 2>/dev/null)
+    if [ -z "$trusted_access" ]; then
+        aws organizations enable-aws-service-access \
+            --service-principal member.org.stacksets.cloudformation.amazonaws.com
+        print_success "Organizations-side trusted access enabled"
+    else
+        print_status "Organizations-side trusted access already enabled"
+    fi
+
+    local cfn_org_status
+    cfn_org_status=$(aws cloudformation describe-organizations-access --region "$REGION" \
+        --query 'Status' --output text 2>/dev/null || echo "DISABLED")
+    if [ "$cfn_org_status" != "ENABLED" ]; then
+        aws cloudformation activate-organizations-access --region "$REGION"
+        print_success "CloudFormation-side organizations access activated"
+    else
+        print_status "CloudFormation-side organizations access already activated"
+    fi
+}
+
 # Function to deploy module 7
 deploy_module7() {
     local payer_name=$1
     local threshold_mb=$2
     local telegram_group_id=$3
-    
+
     if [ -z "$payer_name" ]; then
         print_error "Payer name is required for Module 7"
         print_status "Example: ./scripts/deploy-single.sh 7 --payer-name YourPayerName"
         exit 1
     fi
-    
+
     # Default values
     if [ -z "$threshold_mb" ]; then
         threshold_mb="100"
     fi
-    
+
     if [ -z "$telegram_group_id" ]; then
         telegram_group_id="-862835857"
     fi
-    
+
+    local payer_account_id
+    payer_account_id=$(aws organizations describe-organization --query 'Organization.MasterAccountId' --output text)
+
     print_status "Deploying Module 7: CloudFront Monitoring"
     print_status "Payer Name: $payer_name"
+    print_status "Payer Account ID: $payer_account_id"
     print_status "Threshold: $threshold_mb MB"
     print_status "Telegram Group: $telegram_group_id"
-    print_status "Member accounts will be discovered automatically from AWS Organizations"
-    
+
     local stack_name="${STACK_PREFIX}-cloudfront-monitoring-${TIMESTAMP}"
-    
+
     aws cloudformation create-stack \
         --stack-name "$stack_name" \
         --template-body file://templates/07-cloudfront-monitoring/cloudfront_monitoring.yaml \
         --parameters \
             ParameterKey=PayerName,ParameterValue="$payer_name" \
+            ParameterKey=PayerAccountId,ParameterValue="$payer_account_id" \
             ParameterKey=CloudFrontThresholdMB,ParameterValue="$threshold_mb" \
             ParameterKey=TelegramGroupId,ParameterValue="$telegram_group_id" \
         --capabilities CAPABILITY_NAMED_IAM \
         --region "$REGION"
-    
+
     wait_for_stack "$stack_name" "create"
-    
-    # Get deployment results
-    local monitoring_sink=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' --output text)
-    local alarm_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontAlarmName`].OutputValue' --output text)
-    local alert_function=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`AlertFunctionArn`].OutputValue' --output text)
-    
-    print_success "Module 7 deployed successfully: $stack_name"
+
+    local monitoring_sink
+    monitoring_sink=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`MonitoringSinkArn`].OutputValue' --output text)
+    local alarm_name
+    alarm_name=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontAlarmName`].OutputValue' --output text)
+    local alert_function
+    alert_function=$(aws cloudformation describe-stacks --stack-name $stack_name --query 'Stacks[0].Outputs[?OutputKey==`AlertFunctionArn`].OutputValue' --output text)
+
+    print_success "Module 7 Payer-side infrastructure deployed: $stack_name"
     print_status "OAM Sink ARN: $monitoring_sink"
     print_status "CloudWatch Alarm: $alarm_name"
     print_status "Alert Function: $alert_function"
-    
-    print_warning "CloudFront monitoring is now active with ${threshold_mb}MB threshold"
-    print_status "Monitoring all active member accounts in AWS Organizations"
-    
-    # Show setup results
-    print_status ""
-    print_status "Next steps:"
-    print_status "1. Verify OAM Links are created in member accounts"
-    print_status "2. Test CloudFront traffic monitoring"
-    print_status "3. Monitor Telegram notifications"
-    print_status ""
-    print_status "Monitor CloudWatch Logs:"
-    print_status "  - OAM Setup: /aws/lambda/${payer_name}-OAM-Setup"
-    print_status "  - Alerts: /aws/lambda/${payer_name}-CloudFront-Alert"
+
+    # === OAM Link StackSet (deploy to all member accounts) ===
+    # Without this step the Sink has no attached Links and cross-account
+    # CloudFront metrics never reach the Payer account.
+    enable_stacksets_trusted_access
+
+    local stackset_name="${payer_name}-OAM-Links"
+    print_status "Creating OAM Link StackSet: $stackset_name"
+
+    aws cloudformation create-stack-set \
+        --stack-set-name "$stackset_name" \
+        --template-body file://templates/07-cloudfront-monitoring/oam-link-stackset.yaml \
+        --parameters \
+            ParameterKey=OAMSinkArn,ParameterValue="$monitoring_sink" \
+            ParameterKey=PayerName,ParameterValue="$payer_name" \
+        --capabilities CAPABILITY_IAM \
+        --permission-model SERVICE_MANAGED \
+        --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+        --description "Deploy OAM Links for CloudFront monitoring across member accounts" \
+        --region "$REGION"
+
+    sleep 10
+
+    # Target Root OU so every member account gets a Link regardless of
+    # which OU (Free / Block / Normal / Root) it currently lives in.
+    local root_id
+    root_id=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
+
+    print_status "Deploying StackSet instances to Root OU ($root_id) - covers all member accounts"
+
+    aws cloudformation create-stack-instances \
+        --stack-set-name "$stackset_name" \
+        --deployment-targets OrganizationalUnitIds="$root_id" \
+        --regions "$REGION" \
+        --operation-preferences FailureToleranceCount=10,MaxConcurrentCount=10 \
+        --region "$REGION"
+
+    print_status "StackSet instance creation initiated - deployment runs async (several minutes)"
+    print_status "Verify later with: aws oam list-attached-links --sink-identifier $monitoring_sink"
+
+    print_success "Module 7 deployed successfully (Payer stack + OAM Link StackSet)"
+    print_warning "CloudFront monitoring active with ${threshold_mb}MB threshold"
 }
 
 # Main function

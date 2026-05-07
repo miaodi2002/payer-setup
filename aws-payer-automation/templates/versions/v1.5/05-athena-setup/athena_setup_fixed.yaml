@@ -249,11 +249,10 @@ Resources:
                   return response['Role']['Arn']
 
           def create_glue_crawler(glue, crawler_name, database_name, s3_path, role_arn, schedule=None):
-              """创建Glue Crawler，包含自动调度"""
+              """创建Glue Crawler，包含自动调度 (v1.6: Schedule 显式设置, 失败即报错)"""
               try:
                   crawler = glue.get_crawler(Name=crawler_name)
                   print(f"Crawler {crawler_name} already exists")
-                  # 如果Crawler存在但路径不对，更新它
                   current_path = crawler['Crawler']['Targets']['S3Targets'][0]['Path']
                   if current_path != s3_path:
                       print(f"Updating crawler path from {current_path} to {s3_path}")
@@ -265,7 +264,7 @@ Resources:
                                       'Path': s3_path,
                                       'Exclusions': [
                                           '**.json',
-                                          '**.yml', 
+                                          '**.yml',
                                           '**.sql',
                                           '**.csv',
                                           '**.gz',
@@ -275,17 +274,6 @@ Resources:
                               ]
                           }
                       )
-                  # 设置调度
-                  if schedule:
-                      try:
-                          glue.update_crawler_schedule(
-                              CrawlerName=crawler_name,
-                              Schedule=schedule
-                          )
-                          print(f"Updated schedule for {crawler_name}: {schedule}")
-                      except Exception as e:
-                          print(f"Note: Schedule update for {crawler_name}: {str(e)}")
-                          
               except glue.exceptions.EntityNotFoundException:
                   crawler_config = {
                       'Name': crawler_name,
@@ -298,7 +286,7 @@ Resources:
                                   'Exclusions': [
                                       '**.json',
                                       '**.yml',
-                                      '**.sql', 
+                                      '**.sql',
                                       '**.csv',
                                       '**.gz',
                                       '**.zip'
@@ -311,15 +299,24 @@ Resources:
                           'DeleteBehavior': 'LOG'
                       }
                   }
-                  
-                  # 添加调度配置
-                  if schedule:
-                      crawler_config['Schedule'] = schedule
-                  
                   glue.create_crawler(**crawler_config)
                   print(f"Created crawler: {crawler_name} with path: {s3_path}")
-                  if schedule:
-                      print(f"Crawler scheduled: {schedule}")
+
+              # v1.6 修复: 无论 crawler 是新建还是已存在，都显式调用 update_crawler_schedule
+              # 避免 create_crawler 的 Schedule 参数在某些路径下被忽略
+              if schedule:
+                  glue.update_crawler_schedule(
+                      CrawlerName=crawler_name,
+                      Schedule=schedule
+                  )
+                  verify = glue.get_crawler(Name=crawler_name)
+                  actual_schedule = verify['Crawler'].get('Schedule', {}).get('ScheduleExpression')
+                  if actual_schedule != schedule:
+                      raise RuntimeError(
+                          f"Schedule verification failed for {crawler_name}: "
+                          f"expected '{schedule}', got '{actual_schedule}'"
+                      )
+                  print(f"Verified schedule for {crawler_name}: {actual_schedule}")
 
   # Custom Resource
   SetupAthenaEnvironment:

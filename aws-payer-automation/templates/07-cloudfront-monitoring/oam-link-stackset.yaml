@@ -10,29 +10,26 @@ Parameters:
     Description: "Name of the Payer (used for naming resources)"
 
 Resources:
-  # OAM Link to send CloudFront metrics to Payer account
+  # OAM Link to send CloudWatch metrics to Payer account.
+  # LinkConfiguration.MetricConfiguration.Filter is intentionally omitted:
+  # OAM rejects the JSON-object filter form with "Invalid request provided:
+  # AWS::Oam::Link". The alert Lambda already filters by namespace at query
+  # time, so sharing all CloudWatch metrics is acceptable.
   CloudFrontOAMLink:
     Type: AWS::Oam::Link
     Properties:
       LabelTemplate: !Sub "${PayerName}-member-${AWS::AccountId}"
-      LinkConfiguration:
-        MetricConfiguration:
-          Filter: |
-            {
-              "Namespace": "AWS/CloudFront"
-            }
       ResourceTypes:
         - "AWS::CloudWatch::Metric"
       SinkIdentifier: !Ref OAMSinkArn
+      # AWS::Oam::Link Tags is a Map (key-value object), NOT the standard
+      # CFN [{Key,Value}] list. Using list form causes StackSet instances
+      # to fail with: "#/Tags: expected type: JSONObject, found: JSONArray".
       Tags:
-        - Key: Name
-          Value: !Sub "${PayerName}-CloudFront-OAM-Link"
-        - Key: Purpose
-          Value: "CloudFront monitoring for cost control"
-        - Key: PayerName
-          Value: !Ref PayerName
-        - Key: ManagedBy
-          Value: "AWS Payer Automation"
+        Name: !Sub "${PayerName}-CloudFront-OAM-Link"
+        Purpose: "CloudFront monitoring for cost control"
+        PayerName: !Ref PayerName
+        ManagedBy: "AWS Payer Automation"
 
 Outputs:
   OAMLinkArn:
