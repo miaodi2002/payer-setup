@@ -31,13 +31,23 @@ aws-payer-automation/templates/
 ## 各模块已知 Bug 与处理
 
 ### Module 2 — BillingConductor
-- Lambda 代码调用了**不存在的 `boto3.client('billingconductor').get_billing_group`**（应为 `list_billing_groups`）
-- **后果**：第一次成功创建 BillingGroup 后，"verify" 分支抛异常；fallback 路径第二次 create 撞到 "Cannot associate accounts, which are already associated with billing group" → CFN 进入 ROLLBACK_COMPLETE
-- **关键**：CFN rollback **不会删除**已创建的 BillingGroup 和 Bills 账户（它们是 custom resource 创建的外部资源）
-- **应对**：看到 Module 2 ROLLBACK，先 `aws billingconductor list-billing-groups` —— 如果 `Bills` 已 ACTIVE，直接删掉失败栈，拿 BillingGroup ARN 继续 Module 3，**不要重部 Module 2**
+- **行为**：会**新建一个 AWS 账户** `<MasterName>-Bills`（邮箱用 master 邮箱加 `+bills` alias），3 分钟等其加入 CB family，再建名为 `Bills` 的 BillingGroup（primary = 新建的 Bills 账户）
+- **历史 Bug（已在模板中根因修复，2026-06）**：Lambda 调用了**不存在的 `billingconductor.get_billing_group(Arn=...)`**（BillingConductor API 根本没有 GetBillingGroup，只有 `list_billing_groups`）。`create_billing_group` 成功后 verify 分支抛 `AttributeError` → 内层 `raise verify_error` → 外层 fallback 第二次 create 撞 "Cannot associate accounts, which are already associated with billing group" → CFN ROLLBACK_COMPLETE
+- **修复内容**（`templates/02-billing-conductor/` + `current/` 两份已同步）：
+  1. 新增 helper `get_billing_group_by_arn()`，用 `list_billing_groups` 按 ARN 查找
+  2. 3 处 `get_billing_group(Arn=...)` 调用全部改用该 helper
+  3. verify 块改为**非致命**：create 已返回有效 ARN，名称校验/eventual-consistency 失败只 log 不 raise，不再触发 fallback
+  - 效果：Module 2 现在**第一次就干净部署成功，无 rollback**（已在 883353268373 验证）
+- **若用到旧模板仍 ROLLBACK 的应对**：先 `aws billingconductor list-billing-groups`，若 `Bills` 已 ACTIVE，删掉失败栈、拿 ARN 继续 Module 3，**不要重部 Module 2**（账户和 BillingGroup 是 custom resource 外部资源，rollback 不会删）
 - `deploy_module3` 需要 `--billing-group-arn arn:aws:billingconductor::<PAYER_ID>:billinggroup/<BILLS_ACCOUNT_ID>`
 
 ### Module 5 — Athena Setup
+- **新账户 Glue 限制（2026-06 踩到，会再踩）**：全新 Payer（账户 < 数周）调用 `glue:CreateCrawler` / `CreateJob` / `CreateTrigger` 会被 AWS **账户级**拒绝，报 `AccessDeniedException: Account <id> is denied access`。注意：
+  - 不是 IAM/SCP/Lake Formation/模板问题——`CreateDatabase` 能成功，只有 Glue「计算类」资源（crawler/job/trigger）被拦；deny 同时命中 Lambda 角色和管理员用户两个不同 principal，确属**账户级**
+  - SCP 不影响管理账户，排除；LF 默认 `IAM_ALLOWED_PRINCIPALS/ALL` 不拦；无 Glue resource policy
+  - 这是 AWS 对新账户的**反滥用/验证保留**（Glue crawler/job = 托管计算，类似新账户 EC2 vCPU 配额为 0）。**只能开 AWS Support ticket 请求解除**，或等 AWS 自动放行后重试。模板侧无法绕过
+  - **应对**：Module 5 会 ROLLBACK（custom resource 失败）。先删失败栈：`aws cloudformation delete-stack --stack-name payer-athena-setup-<ts>`。Lambda 对 DB/role 是幂等的（`GetDatabase` 命中才跳过），残留的 `athenacurcfn_*` 库不影响重试。解除限制后**原样重跑 Module 5 命令**即可
+  - 快速判定：`aws glue create-crawler --name probe --role <any> --database-name <any> --targets '{"S3Targets":[{"Path":"s3://x/"}]}'`；若返回 `Account ... is denied access` 即被限制，别浪费时间查 IAM
 - `deploy-single.sh` 必须指向 `athena_setup_fixed.yaml`（v1.5，含 IAM 传播等待 + Schedule）
 - 基础版 `athena_setup.yaml` 有两个致命问题：
   1. 无 IAM 角色传播等待 → `InvalidInputException: Service is unable to assume provided role`
