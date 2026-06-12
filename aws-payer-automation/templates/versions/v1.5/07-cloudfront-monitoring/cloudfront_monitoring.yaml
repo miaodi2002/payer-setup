@@ -108,152 +108,166 @@ Resources:
           import boto3
           import urllib.request
           import urllib.parse
-          from datetime import datetime, timedelta
+          from datetime import datetime, timedelta, timezone
           import os
-          
+
           def lambda_handler(event, context):
               print(f"Received CloudWatch alarm event: {json.dumps(event)}")
-              
+
               for record in event['Records']:
                   sns_message = record['Sns']['Message']
                   message = json.loads(sns_message)
-                  
+
                   # Extract alarm information
                   alarm_name = message['AlarmName']
                   new_state = message['NewStateValue']
                   reason = message['NewStateReason']
                   region = message['Region']
-                  
+
                   print(f"Processing alarm: {alarm_name}, State: {new_state}")
-                  
+
                   if new_state == 'ALARM':
-                      # Find high usage accounts
-                      high_usage_accounts = find_high_usage_accounts()
-                      
+                      # Parse the alarm evaluation time so we query the same window
+                      state_change_time = parse_state_change_time(message.get('StateChangeTime'))
+
+                      # Find top traffic accounts that drove the alarm
+                      top_accounts = find_top_usage_accounts(state_change_time)
+
                       # Send Telegram alert
-                      send_cloudfront_alert(alarm_name, high_usage_accounts, message)
-              
+                      send_cloudfront_alert(alarm_name, top_accounts, message, state_change_time)
+
               return {
                   'statusCode': 200,
                   'body': json.dumps('Success')
               }
-          
-          def find_high_usage_accounts():
-              cloudwatch = boto3.client('cloudwatch')
-              organizations = boto3.client('organizations')
-              threshold_mb = int(os.environ['THRESHOLD_MB'])
-              threshold_bytes = threshold_mb * 1024 * 1024
-              
-              # 动态获取所有活跃的成员账户
-              try:
-                  # 获取Master Account ID
-                  org_info = organizations.describe_organization()
-                  master_account_id = org_info['Organization']['MasterAccountId']
-                  
-                  # 获取所有活跃账户，排除Master Account
-                  accounts = organizations.list_accounts()
-                  member_accounts = [
-                      account['Id'] 
-                      for account in accounts['Accounts'] 
-                      if account['Status'] == 'ACTIVE' and account['Id'] != master_account_id
-                  ]
-                  
-                  print(f"Found {len(member_accounts)} active member accounts to check")
-                  
-              except Exception as e:
-                  print(f"Error getting member accounts: {str(e)}")
-                  return []
-              
-              high_usage = []
-              
-              for account_id in member_accounts:
-                  if not account_id:
-                      continue
-                  
+
+          def parse_state_change_time(raw):
+              # CloudWatch sends e.g. "2026-05-17T00:30:18.928+0000"
+              if raw:
                   try:
-                      # Query CloudFront BytesDownloaded for specific account
-                      response = cloudwatch.get_metric_data(
-                          MetricDataQueries=[{
-                              'Id': f"cloudfront_{account_id.replace('-', '_')}",
-                              'MetricStat': {
-                                  'Metric': {
-                                      'Namespace': 'AWS/CloudFront',
-                                      'MetricName': 'BytesDownloaded'
-                                  },
-                                  'Period': 900,  # 15 minutes
-                                  'Stat': 'Sum'
-                              },
-                              'ReturnData': True
-                          }],
-                          StartTime=datetime.now() - timedelta(minutes=15),
-                          EndTime=datetime.now()
-                      )
-                      
-                      if response['MetricDataResults'] and response['MetricDataResults'][0]['Values']:
-                          total_bytes = sum(response['MetricDataResults'][0]['Values'])
-                          total_mb = round(total_bytes / 1024.0 / 1024.0, 2)
-                          
-                          if total_bytes > threshold_bytes:
-                              high_usage.append({
-                                  'account_id': account_id,
-                                  'usage_mb': total_mb,
-                                  'usage_bytes': total_bytes
-                              })
-                      
+                      cleaned = raw.replace('Z', '+0000')
+                      # strip fractional seconds for robust parsing
+                      if '.' in cleaned:
+                          head, tail = cleaned.split('.', 1)
+                          tz = tail[-5:] if (tail.endswith('0000') or '+' in tail or '-' in tail[1:]) else '+0000'
+                          cleaned = head + tz
+                      return datetime.strptime(cleaned, '%Y-%m-%dT%H:%M:%S%z')
                   except Exception as e:
-                      print(f"Error querying account {account_id}: {str(e)}")
-              
-              # Sort by usage descending
-              return sorted(high_usage, key=lambda x: x['usage_mb'], reverse=True)
+                      print(f"Could not parse StateChangeTime '{raw}': {e}")
+              return datetime.now(timezone.utc)
           
-          def send_cloudfront_alert(alarm_name, high_usage_accounts, alarm_details):
+          def find_top_usage_accounts(state_change_time):
+              # OAM monitoring account: list-metrics + Metrics Insights span all
+              # linked member accounts. Build DistributionId -> OwningAccount map,
+              # then aggregate per-distribution traffic back to the owning account.
+              cloudwatch = boto3.client('cloudwatch')
+
+              try:
+                  dist_to_account = {}
+                  paginator = cloudwatch.get_paginator('list_metrics')
+                  for page in paginator.paginate(
+                      Namespace='AWS/CloudFront',
+                      MetricName='BytesDownloaded',
+                      IncludeLinkedAccounts=True,
+                  ):
+                      owners = page.get('OwningAccounts', [])
+                      for metric, owner in zip(page.get('Metrics', []), owners):
+                          dist = next((d['Value'] for d in metric.get('Dimensions', [])
+                                       if d['Name'] == 'DistributionId'), None)
+                          if dist:
+                              dist_to_account[dist] = owner
+
+                  print(f"Mapped {len(dist_to_account)} distributions to owning accounts")
+
+                  end = state_change_time.replace(second=0, microsecond=0)
+                  start = end - timedelta(minutes=15)
+                  result = cloudwatch.get_metric_data(
+                      MetricDataQueries=[{
+                          'Id': 'q',
+                          'Expression': (
+                              'SELECT SUM(BytesDownloaded) FROM SCHEMA('
+                              '"AWS/CloudFront", DistributionId,Region) '
+                              'GROUP BY DistributionId'
+                          ),
+                          'Period': 900,
+                      }],
+                      StartTime=start,
+                      EndTime=end,
+                  )
+              except Exception as e:
+                  print(f"Error querying CloudFront metrics: {str(e)}")
+                  return []
+
+              acct_total = {}
+              acct_dists = {}
+              for series in result.get('MetricDataResults', []):
+                  dist = series.get('Label', 'unknown')
+                  mb = sum(series.get('Values', [])) / 1048576.0
+                  if mb <= 0:
+                      continue
+                  acct = dist_to_account.get(dist, 'unknown')
+                  acct_total[acct] = acct_total.get(acct, 0) + mb
+                  acct_dists.setdefault(acct, []).append((dist, round(mb, 2)))
+
+              top = []
+              for acct, mb in sorted(acct_total.items(), key=lambda x: -x[1])[:5]:
+                  top.append({
+                      'account_id': acct,
+                      'usage_mb': round(mb, 2),
+                      'top_distributions': sorted(
+                          acct_dists[acct], key=lambda x: -x[1])[:3],
+                  })
+              return top
+          
+          def send_cloudfront_alert(alarm_name, top_accounts, alarm_details, state_change_time):
               payer_name = os.environ['PAYER_NAME']
               payer_account_id = os.environ['PAYER_ACCOUNT_ID']
               threshold_mb = os.environ['THRESHOLD_MB']
-              
+
               # Build formatted message with Payer name and ID
               payer_display = f"{payer_name}({payer_account_id})"
-              message = build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details)
-              
+              message = build_alert_message(payer_display, alarm_name, top_accounts, threshold_mb, state_change_time)
+
               # Send to Telegram
               send_telegram_message(message)
-          
-          def build_alert_message(payer_display, alarm_name, high_usage_accounts, threshold_mb, alarm_details):
-              timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-              
+
+          def build_alert_message(payer_display, alarm_name, top_accounts, threshold_mb, state_change_time):
+              timestamp = state_change_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+
               message = f"🚨 CloudFront流量告警 - {payer_display}\n\n"
-              
-              if high_usage_accounts:
-                  message += "📊 超量账户详情:\n"
+
+              if top_accounts:
+                  message += "📊 Top 流量账户 (近15分钟):\n"
                   message += "┌─────────────────────────\n"
-                  
-                  for index, account in enumerate(high_usage_accounts[:5]):
+
+                  for index, account in enumerate(top_accounts):
                       percentage = round((account['usage_mb'] / float(threshold_mb) - 1) * 100, 1)
+                      sign = '+' if percentage >= 0 else ''
                       message += f"│ {index + 1}. 账户: {account['account_id']}\n"
-                      message += f"│    用量: {account['usage_mb']} MB\n"
-                      message += f"│    超出: +{percentage}%\n"
-                      if index < len(high_usage_accounts[:5]) - 1:
+                      message += f"│    用量: {account['usage_mb']} MB (阈值 {threshold_mb} MB, {sign}{percentage}%)\n"
+                      if account.get('top_distributions'):
+                          message += "│    Top distributions:\n"
+                          for dist_id, dist_mb in account['top_distributions']:
+                              message += f"│      • {dist_id}: {dist_mb} MB\n"
+                      if index < len(top_accounts) - 1:
                           message += "├─────────────────────────\n"
-                  
+
                   message += "└─────────────────────────\n\n"
-                  
-                  if len(high_usage_accounts) > 5:
-                      message += f"📋 另有 {len(high_usage_accounts) - 5} 个账户超限\n\n"
               else:
-                  message += "📊 正在分析具体超量账户...\n\n"
-              
+                  message += "❌ 无法获取流量明细，请人工排查 CloudWatch\n\n"
+
               message += "📈 告警信息:\n"
               message += f"• 告警名称: {alarm_name}\n"
               message += f"• 设定阈值: {threshold_mb} MB\n"
               message += "• 监控周期: 15分钟\n"
               message += f"• 告警时间: {timestamp}\n\n"
-              
+
               message += "⚠️ 建议立即检查CloudFront使用情况\n\n"
-              
+
               message += "🔗 快速链接:\n"
               message += "• CloudFront: https://console.aws.amazon.com/cloudfront\n"
               message += "• CloudWatch: https://console.aws.amazon.com/cloudwatch"
-              
+
               return message
           
           def send_telegram_message(message):
