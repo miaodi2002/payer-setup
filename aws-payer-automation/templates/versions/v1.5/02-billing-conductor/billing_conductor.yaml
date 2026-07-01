@@ -1,6 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: "Create AWS Account and BillingConductor BillingGroup automatically"
 
+Parameters:
+  PrimaryAccountId:
+    Type: String
+    Default: ""
+    Description: "Existing member account ID to use as the BillingGroup primary account. Leave empty to create a new '<Master>-Bills' account (legacy behavior)."
+    AllowedPattern: "^$|^[0-9]{12}$"
+    ConstraintDescription: "Must be empty or a 12-digit AWS account ID"
+
 Resources:
   # Lambda执行角色
   LambdaExecutionRole:
@@ -75,40 +83,53 @@ Resources:
 
                   print(f"Master Account: {master_account_name} ({master_account_email})")
 
-                  # 2. 检查是否已存在Bills账户
-                  new_account_name = f"{master_account_name}-Bills"
-                  base_email = generate_bills_email(master_account_email)
-                  
-                  # 3. 查找现有的Bills账户
-                  existing_account = find_existing_bills_account(organizations, master_account_name, master_account_email)
-                  
-                  if existing_account:
-                      new_account_id = existing_account['Id']
-                      new_account_email = existing_account['Email']
-                      print(f"Found existing Bills account: {existing_account['Name']} ({new_account_email}) - ID: {new_account_id}")
+                  # 读取可选的 PrimaryAccountId：若指定则用现有账户，跳过账户创建
+                  props = event.get('ResourceProperties', {})
+                  primary_account_override = (props.get('PrimaryAccountId') or '').strip()
+
+                  if primary_account_override:
+                      # 使用调用方指定的现有账户作为BillingGroup primary，跳过账户创建与CB family等待
+                      new_account_id = primary_account_override
+                      acct = organizations.describe_account(AccountId=new_account_id)['Account']
+                      new_account_email = acct['Email']
+                      if acct.get('Status') != 'ACTIVE':
+                          raise Exception(f"PrimaryAccountId {new_account_id} is not ACTIVE (status={acct.get('Status')})")
+                      print(f"Using existing account as BillingGroup primary: {acct['Name']} ({new_account_email}) - ID: {new_account_id}")
                   else:
-                      # 4. 如果不存在，查找可用邮箱并创建新账户
-                      new_account_email = find_available_email(organizations, base_email)
-                      
-                      print(f"No existing Bills account found. Creating new account: {new_account_name} ({new_account_email})")
+                      # 2. 检查是否已存在Bills账户
+                      new_account_name = f"{master_account_name}-Bills"
+                      base_email = generate_bills_email(master_account_email)
 
-                      # 5. 创建新账户
-                      create_response = organizations.create_account(
-                          Email=new_account_email,
-                          AccountName=new_account_name
-                      )
-                      
-                      request_id = create_response['CreateAccountStatus']['Id']
-                      print(f"Account creation request ID: {request_id}")
+                      # 3. 查找现有的Bills账户
+                      existing_account = find_existing_bills_account(organizations, master_account_name, master_account_email)
 
-                      # 6. 等待账户创建完成
-                      new_account_id = wait_for_account_creation(organizations, request_id)
-                      print(f"New account created: {new_account_id}")
-                      
-                      # 7. 等待3分钟让账户加入Consolidated Billing family
-                      print("Waiting 3 minutes for the account to join the CB family...")
-                      wait_for_cb_family_integration(180)  # 3分钟 = 180秒
-                      print("Wait completed. Account should now be available for BillingConductor operations.")
+                      if existing_account:
+                          new_account_id = existing_account['Id']
+                          new_account_email = existing_account['Email']
+                          print(f"Found existing Bills account: {existing_account['Name']} ({new_account_email}) - ID: {new_account_id}")
+                      else:
+                          # 4. 如果不存在，查找可用邮箱并创建新账户
+                          new_account_email = find_available_email(organizations, base_email)
+
+                          print(f"No existing Bills account found. Creating new account: {new_account_name} ({new_account_email})")
+
+                          # 5. 创建新账户
+                          create_response = organizations.create_account(
+                              Email=new_account_email,
+                              AccountName=new_account_name
+                          )
+
+                          request_id = create_response['CreateAccountStatus']['Id']
+                          print(f"Account creation request ID: {request_id}")
+
+                          # 6. 等待账户创建完成
+                          new_account_id = wait_for_account_creation(organizations, request_id)
+                          print(f"New account created: {new_account_id}")
+
+                          # 7. 等待3分钟让账户加入Consolidated Billing family
+                          print("Waiting 3 minutes for the account to join the CB family...")
+                          wait_for_cb_family_integration(180)  # 3分钟 = 180秒
+                          print("Wait completed. Account should now be available for BillingConductor operations.")
 
                   # 8. 创建或查找BillingGroup
                   billing_group_arn = create_or_find_billing_group(billingconductor, new_account_id)
@@ -493,6 +514,7 @@ Resources:
     Type: Custom::CreateAccountAndBillingGroup
     Properties:
       ServiceToken: !GetAtt CreateAccountAndBillingGroupFunction.Arn
+      PrimaryAccountId: !Ref PrimaryAccountId
 
 Outputs:
   NewAccountId:

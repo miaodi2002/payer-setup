@@ -42,7 +42,9 @@ show_usage() {
     echo "  1 - OU and SCP Setup"
     echo "      Parameters: --root-id <root_id>"
     echo "  2 - BillingConductor Setup"
-    echo "      Parameters: none"
+    echo "      Parameters: [--primary-account-id <12-digit-account-id>]"
+    echo "      Note: If --primary-account-id is set, an existing member account is used as the"
+    echo "            BillingGroup primary. If omitted, a new '<Master>-Bills' account is created."
     echo "  3 - Pro forma CUR Export"
     echo "      Parameters: --billing-group-arn <arn>"
     echo "  4 - RISP CUR Export"
@@ -58,6 +60,7 @@ show_usage() {
     echo "Examples:"
     echo "  $0 1 --root-id r-abcd1234"
     echo "  $0 2"
+    echo "  $0 2 --primary-account-id 572590827717"
     echo "  $0 3 --billing-group-arn arn:aws:billingconductor::123456789012:billinggroup/12345678"
     echo "  $0 4"
     echo "  $0 5 --proforma-bucket bip-cur-123456789012 --risp-bucket bip-risp-cur-123456789012 --proforma-report 123456789012 --risp-report risp-123456789012"
@@ -138,13 +141,22 @@ deploy_module1() {
 
 # Function to deploy module 2
 deploy_module2() {
+    local primary_account_id="$1"
+
     print_status "Deploying Module 2: BillingConductor Setup"
-    
+
     local stack_name="${STACK_PREFIX}-billing-conductor-${TIMESTAMP}"
-    
+
+    local param_args=()
+    if [ -n "$primary_account_id" ]; then
+        param_args=(--parameters ParameterKey=PrimaryAccountId,ParameterValue="$primary_account_id")
+        print_status "Using existing primary account: $primary_account_id (no new account will be created)"
+    fi
+
     aws cloudformation create-stack \
         --stack-name "$stack_name" \
         --template-body file://templates/02-billing-conductor/billing_conductor.yaml \
+        "${param_args[@]}" \
         --capabilities CAPABILITY_NAMED_IAM \
         --region "$REGION"
     
@@ -498,7 +510,21 @@ main() {
             deploy_module1 "$ROOT_ID"
             ;;
         2)
-            deploy_module2
+            # Parse parameters for module 2
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    --primary-account-id)
+                        PRIMARY_ACCOUNT_ID="$2"
+                        shift 2
+                        ;;
+                    *)
+                        print_error "Unknown parameter: $1"
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+            deploy_module2 "$PRIMARY_ACCOUNT_ID"
             ;;
         3)
             # Parse parameters for module 3
